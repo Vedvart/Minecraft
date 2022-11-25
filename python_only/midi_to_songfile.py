@@ -1,7 +1,8 @@
 import mido
 import numpy as np
 
-filename = 'Portal - Still Alive.mid'
+filename = 'symphony_183_1_(c)ishii.mid'
+output_filename = 'symphony.song'
 
 mid = mido.MidiFile(filename, clip=True)
 
@@ -21,6 +22,8 @@ for track in mid.tracks[1:]:
 
 	msg_list = np.array([x for x in track])
 	midi_notelist = np.array([[msg_list[i].note, (msg_list[i].velocity if msg_list[i].type=='note_on' else 0), times[i]] for i in range(len(times)) if (msg_list[i].type == 'note_on' or msg_list[i].type == 'note_off')])
+
+	if len(midi_notelist) == 0: continue
 
 	for note in set(midi_notelist[:,0]):
 
@@ -60,5 +63,5 @@ for tempo, start_time in tempo_changes:
 	last_tempo = tempo
 
 notelist_string = '{' + ','.join(['"' + str(round(x[0],2)) + ',' + str(round(x[1],3)) + ',' + str(round(x[2],2)) + '"' for x in notelist]) + '}'
-with open(filename+'.song', 'w') as file:
+with open(output_filename, 'w') as file:
 	file.write(notelist_string)

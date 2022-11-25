@@ -1,8 +1,8 @@
 import mido
 import numpy as np
 
-filename = 'Never-Gonna-Give-You-Up-1.mid'
-song_title = 'rickroll'
+filename = 'Super Mario 64 - Medley.mid'
+song_title = 'sm64.song'
 
 mid = mido.MidiFile(filename, clip=True)
 

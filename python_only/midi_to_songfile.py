@@ -2,7 +2,7 @@ import mido
 import numpy as np
 
 filename = 'Super Mario 64 - Medley.mid'
-song_title = 'sm64.song'
+song_title = 'sm64'
 
 mid = mido.MidiFile(filename, clip=True)
 

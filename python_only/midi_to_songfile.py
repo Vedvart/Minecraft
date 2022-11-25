@@ -1,8 +1,8 @@
 import mido
 import numpy as np
 
-filename = 'symphony_183_1_(c)ishii.mid'
-song_title = 'symphony'
+filename = 'Never-Gonna-Give-You-Up-3.mid'
+song_title = 'rickroll'
 
 mid = mido.MidiFile(filename, clip=True)
 
@@ -15,7 +15,7 @@ tempo_changes = np.array([[msg_list[i].tempo, times[i]] for i in range(len(times
 
 notelist = []
 
-for track in mid.tracks[1:]:
+for track in mid.tracks:
 
 	deltatimes = np.array([x.time for x in track])
 	times = np.cumsum(deltatimes)

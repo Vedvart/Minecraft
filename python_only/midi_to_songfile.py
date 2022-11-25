@@ -2,7 +2,7 @@ import mido
 import numpy as np
 
 filename = 'symphony_183_1_(c)ishii.mid'
-output_filename = 'symphony.song'
+song_title = 'symphony'
 
 mid = mido.MidiFile(filename, clip=True)
 
@@ -63,5 +63,18 @@ for tempo, start_time in tempo_changes:
 	last_tempo = tempo
 
 notelist_string = '{' + ','.join(['"' + str(round(x[0],2)) + ',' + str(round(x[1],3)) + ',' + str(round(x[2],2)) + '"' for x in notelist]) + '}'
-with open(output_filename, 'w') as file:
-	file.write(notelist_string)
+
+files_to_write = []
+if len(notelist_string) > 26000:
+	while len(notelist_string) > 26000:
+		break_point = notelist_string[26000:].index('",')
+		break_segment = notelist_string[:26000 + break_point + 1] + '}'
+		files_to_write.append(break_segment)
+		notelist_string = '{' + notelist_string[26000 + break_point + 2:]
+	files_to_write.append(notelist_string)
+else:
+	files_to_write.append(notelist_string)
+
+for i in range(len(files_to_write)):
+	with open(song_title + ('_' + str(i) if len(files_to_write) > 1 else '') + '.song', 'w') as file:
+		file.write(files_to_write[i])

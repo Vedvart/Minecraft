@@ -62,6 +62,8 @@ for tempo, start_time in tempo_changes:
 	last_tps = new_tps
 	last_tempo = tempo
 
+print(notelist[:20])
+
 notelist_string = '{' + ','.join(['"' + str(round(x[0],2)) + ',' + str(round(x[1],3)) + ',' + str(round(x[2],2)) + '"' for x in notelist]) + '}'
 
 files_to_write = []

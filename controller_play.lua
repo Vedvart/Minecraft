@@ -1,9 +1,9 @@
--- jukebox_monitor.lua
+-- jukebox_monitor.lua (fixed)
 -- Advanced monitor UI + non-blocking streamer + pause/resume/restart + live progress.
 
 -- ========= Config =========
 local PROTOCOL      = "ccaudio_sync_v1"
-local DEFAULT_DELAY = 4000            -- more time for clients to prebuffer
+local DEFAULT_DELAY = 4000            -- time for clients to prebuffer
 local CHUNK_BYTES   = 8192
 local TRACK_PATH    = "/disk/music/track.dfpwm"
 local VOLUME        = 1.0
@@ -93,6 +93,9 @@ local start_ms = 0
 local pause_accum = 0
 local pause_started = 0
 
+-- streamer thread handle
+local streamer_thread = nil
+
 -- Load/Title
 local function loadTrack()
   assert(fs.exists(TRACK_PATH), "Track not found: "..TRACK_PATH)
@@ -137,35 +140,21 @@ local function redraw()
   ui:bar(2,10,w-3,pct)
 end
 
--- Session helpers
 local function new_sid() return tostring(now_ms()).."-"..tostring(math.random(1000,9999)) end
 
--- Streaming runs in its own coroutine and NEVER pulls arbitrary events.
-local streamer_running = false
-local function streamer(current_sid, current_start_ms)
-  streamer_running = true
-  -- push chunks
-  for i=1,#chunks do
-    broadcast({ cmd="CHUNK", sid=current_sid, seq=i, data=chunks[i] })
-    sleep(0) -- yield without consuming events
-  end
-  -- tell clients total count and start time (they wait until this)
-  broadcast({ cmd="END", sid=current_sid, total=#chunks, start_epoch_ms=current_start_ms })
-
-  -- handle NACKs for a while without blocking UI
-  local deadline = os.startTimer(10)
-  while true do
-    local e,p1,p2,p3 = os.pullEvent()
-    if e=="timer" and p1==deadline then break end
-    if e=="rednet_message" and p3==PROTOCOL then
-      local sender,msg = p1,p2
-      if type(msg)=="table" and msg.cmd=="NACK" and msg.sid==current_sid then
-        local seq = tonumber(msg.seq or -1)
-        if seq and chunks[seq] then rednet.send(sender, { cmd="CHUNK", sid=current_sid, seq=seq, data=chunks[seq] }, PROTOCOL) end
-      end
+-- Streamer: ONLY sends CHUNKs/END and yields with sleep(0). No event pulling here.
+local function start_streamer(current_sid, current_start_ms)
+  streamer_thread = coroutine.create(function()
+    -- Push chunks
+    for i=1,#chunks do
+      broadcast({ cmd="CHUNK", sid=current_sid, seq=i, data=chunks[i] })
+      sleep(0) -- yield but don't eat events
     end
-  end
-  streamer_running = false
+    -- Tell clients total & the agreed start time
+    broadcast({ cmd="END", sid=current_sid, total=#chunks, start_epoch_ms=current_start_ms })
+    -- Done; thread exits.
+  end)
+  coroutine.resume(streamer_thread)
 end
 
 -- Control ops
@@ -176,17 +165,11 @@ local function do_start()
   start_ms = now_ms() + DEFAULT_DELAY
   playing=true
 
+  -- Tell clients to prep
   broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=VOLUME, name=title })
 
-  -- fire streamer concurrently
-  parallel.waitForAny(
-    function() streamer(sid, start_ms) end,
-    function()
-      -- allow a brief READY window while the streamer starts
-      local t=os.startTimer(0.6)
-      while true do local e,a= os.pullEvent(); if e=="timer" and a==t then break end end
-    end
-  )
+  -- Kick off the streamer (independent coroutine)
+  start_streamer(sid, start_ms)
 end
 
 local function do_toggle_pause()
@@ -197,7 +180,7 @@ local function do_toggle_pause()
   else
     pause_accum = pause_accum + (now_ms() - pause_started)
     paused=false
-    local resume_at = now_ms() + 1200 -- give everyone time to un-pause cleanly
+    local resume_at = now_ms() + 1200
     broadcast({ cmd="RESUME", sid=sid, start_epoch_ms=resume_at })
   end
 end
@@ -213,9 +196,14 @@ local function main()
   term.redirect(mon); term.setCursorBlink(false)
   loadTrack(); readTitle(); redraw()
 
-  -- UI + timers + net handling loop (never blocked by streaming)
   local refresh = os.startTimer(0.1)
+
   while true do
+    -- If streamer is alive, keep it running
+    if streamer_thread and coroutine.status(streamer_thread) == "suspended" then
+      coroutine.resume(streamer_thread)
+    end
+
     local e = { os.pullEvent() }
 
     if e[1]=="monitor_touch" then
@@ -234,12 +222,16 @@ local function main()
       redraw()
       refresh = os.startTimer( playing and 0.1 or 0.25 )
 
-    elseif e[1]=="rednet_message" then
-      -- Optional: log RESULT/PAUSED/RESUMED if you like
-      -- local sender,msg,proto = e[2],e[3],e[4]
+    elseif e[1]=="rednet_message" and e[4]==PROTOCOL then
+      -- Handle NACKs here so the streamer never pulls events
+      local sender,msg = e[2],e[3]
+      if type(msg)=="table" and msg.cmd=="NACK" and msg.sid==sid then
+        local seq = tonumber(msg.seq or -1)
+        if seq and chunks[seq] then rednet.send(sender, { cmd="CHUNK", sid=sid, seq=seq, data=chunks[seq] }, PROTOCOL) end
+      end
     end
   end
 end
 
-print("Controller UI ready. Use the monitor to Play/Pause or Restart.")
+print("Controller UI ready. Touch Play/Pause or Restart.")
 main()

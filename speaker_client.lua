@@ -1,16 +1,12 @@
--- jukebox_monitor.lua  (1-tick control path)
--- Advanced monitor UI with near-instant Play/Pause/Restart and tick-rate progress.
+-- speaker_client_stream.lua  (1-tick control)
+-- Fast-reacting streaming client with instant pause via speaker.stop().
 
--- ===== Config =====
-local PROTOCOL        = "ccaudio_sync_v1"
-local DEFAULT_DELAYMS = 50          -- 1 tick arm time
-local CHUNK_BYTES     = 64          -- ~10.7ms audio per chunk
-local CHUNKS_PER_PUMP = 64          -- push many chunks between events
-local TRACK_PATH      = "/disk/music/track.dfpwm"
-local VOLUME          = 1.0
--- ===================
+local PROTOCOL = "ccaudio_sync_v1"
+local CHUNK_REQUEST_INTERVAL = 0.10 -- quicker re-requests
+local PREBUFFER_TARGET = 1          -- start once we have 1 chunk
+local IDLE_WAIT = 0.02              -- small wait when missing a chunk
 
--- Utils
+-- Open any modem
 local function openAnyModem()
   for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" then
@@ -18,200 +14,128 @@ local function openAnyModem()
     end
   end
 end
-local function findMonitor()
-  local mon = peripheral.find("monitor")
-  assert(mon, "No monitor attached")
-  assert(mon.isColor and mon.isColor(), "Advanced monitor required")
-  mon.setTextScale(0.5)
-  return mon
-end
-local function findDrive() local d=peripheral.find("drive"); assert(d,"No disk drive attached"); return d end
-local function now_ms() return os.epoch("utc") end
-local function fmt_time(s) s=math.max(0,math.floor(s+0.5)); return ("%d:%02d"):format(math.floor(s/60), s%60) end
-local function basename(p) p=tostring(p):gsub("[/\\]+$",""); return p:match("([^/\\]+)$") or p end
-local function broadcast(msg) rednet.broadcast(msg, PROTOCOL) end
-
--- UI helper
-local UI = {}
-function UI.new(mon)
-  local o={mon=mon,w=0,h=0,buttons={}}
-  function o:resize() self.w,self.h=self.mon.getSize() end
-  function o:clear() self.mon.setBackgroundColor(colors.black); self.mon.clear() end
-  function o:btn(id,label,x,y,w,h,active)
-    self.buttons[id]={x=x,y=y,w=w,h=h}
-    self.mon.setBackgroundColor(active and colors.lime or colors.gray)
-    self.mon.setTextColor(colors.black)
-    for yy=y,y+h-1 do self.mon.setCursorPos(x,yy); self.mon.write((" "):rep(w)) end
-    self.mon.setCursorPos(x+math.floor((w-#label)/2), y+math.floor(h/2)); self.mon.write(label)
-    self.mon.setBackgroundColor(colors.black); self.mon.setTextColor(colors.white)
-  end
-  function o:bar(x,y,w,value)
-    value=math.max(0,math.min(1,value or 0))
-    local fill=math.floor(w*value+0.5)
-    self.mon.setCursorPos(x,y); self.mon.setBackgroundColor(colors.gray); self.mon.write((" "):rep(w))
-    self.mon.setCursorPos(x,y); self.mon.setBackgroundColor(colors.lightBlue); if fill>0 then self.mon.write((" "):rep(fill)) end
-    self.mon.setBackgroundColor(colors.black)
-  end
-  function o:text(x,y,msg,fg,bg)
-    if bg then self.mon.setBackgroundColor(bg) end; if fg then self.mon.setTextColor(fg) end
-    self.mon.setCursorPos(x,y); self.mon.write(msg)
-    self.mon.setTextColor(colors.white); self.mon.setBackgroundColor(colors.black)
-  end
-  function o:hit(x,y)
-    for id,b in pairs(self.buttons) do if x>=b.x and y>=b.y and x<b.x+b.w and y<b.y+b.h then return id end end
-  end
-  o:resize(); return o
-end
-
--- State
-local mon = findMonitor()
-local drive = findDrive()
 openAnyModem(); assert(rednet.isOpen(), "No modem open")
 
-local ui = UI.new(mon)
-local chunks={}, fileBytes=0, durationSec=0, title="Unknown"
+-- Find speaker + decoder
+local speaker = peripheral.find("speaker")
+assert(speaker, "No speaker attached")
+local dfpwm = require("cc.audio.dfpwm")
 
-local playing=false, paused=false
-local sid=nil, start_ms=0
-local pause_accum=0, pause_started=0
+-- Session state
+local sess = nil
+-- sess = { sid, controller_id, start_ms, volume, buffer[seq]=data, next_seq, ended, total, paused, last_nack_time }
 
--- streamer coroutine (non-blocking; yields manually)
-local streamer = nil
+local function reset_session() sess = nil end
+local function begin_session(sid, controller_id, start_ms, volume)
+  sess = {
+    sid=sid, controller_id=controller_id,
+    start_ms=tonumber(start_ms) or 0, volume=tonumber(volume) or 1.0,
+    buffer={}, next_seq=1, ended=false, total=nil, paused=false,
+    last_nack_time=0
+  }
+end
 
--- Load/Title
-local function loadTrack()
-  assert(fs.exists(TRACK_PATH), "Track not found: "..TRACK_PATH)
-  chunks = {}
-  fileBytes = fs.getSize(TRACK_PATH)
-  durationSec = (fileBytes * 8) / 48000
-  local fh = fs.open(TRACK_PATH, "rb")
-  while true do
-    local data = fh.read(CHUNK_BYTES)
-    if not data then break end
-    chunks[#chunks+1] = data
+local function send(to, msg) if to then rednet.send(to, msg, PROTOCOL) end end
+local function ack(to, cmd, extra)
+  local t={cmd=cmd, id=os.getComputerID()}; if extra then for k,v in pairs(extra) do t[k]=v end end
+  send(to, t)
+end
+
+local function now_ms() return os.epoch("utc") end
+local function wait_until(ms) while now_ms() < ms do sleep(0.005) end end
+
+local function hard_stop_audio()
+  if speaker.stop then pcall(function() speaker.stop() end) end
+  os.queueEvent("speaker_audio_empty") -- nudge any waiters
+end
+
+local function play_loop()
+  -- Minimal prebuffer & start alignment (1 tick arm by controller)
+  while sess and (now_ms() + 1 < sess.start_ms) do sleep(0.005) end
+  -- Also ensure at least one chunk available if time already reached
+  while sess and now_ms() >= sess.start_ms do
+    local have = sess.buffer[sess.next_seq] ~= nil
+    if have then break end
+    os.pullEventTimeout("rednet_message", IDLE_WAIT)
   end
-  fh.close()
-end
 
-local function readTitle()
-  local label = drive.getDiskLabel and drive.getDiskLabel() or nil
-  title = (label and #label>0) and label or basename(TRACK_PATH)
-end
+  local decoder = dfpwm.make_decoder()
 
--- Playhead estimate (UI only)
-local function playhead_sec()
-  if not playing then return 0 end
-  local base = paused and (pause_started - start_ms - pause_accum)
-                or (now_ms() - start_ms - pause_accum)
-  return math.max(0, base/1000)
-end
-
--- UI redraw (every tick)
-local function redraw()
-  ui:resize(); ui:clear()
-  local w,h = ui.w, ui.h
-  ui:text(2,2,"Now Playing:",colors.yellow)
-  ui:text(2,3,title,colors.white)
-  local playLabel = paused and "Resume" or (playing and "Pause" or "Play")
-  ui:btn("playpause", playLabel, 2,5,10,3, playing and not paused)
-  ui:btn("restart",  "Restart", 14,5,10,3, false)
-  local elapsed = math.min(playhead_sec(), durationSec)
-  local pct = durationSec>0 and (elapsed/durationSec) or 0
-  ui:text(2,9,("[%s / %s]"):format(fmt_time(elapsed), fmt_time(durationSec)), colors.white)
-  ui:bar(2,10,w-3,pct)
-end
-
-local function new_sid() return tostring(now_ms()).."-"..tostring(math.random(1000,9999)) end
-
--- Streamer: send CHUNKs fast, but never block the UI loop
-local function start_streamer(current_sid, current_start_ms)
-  streamer = coroutine.create(function()
-    local i = 1
-    while i <= #chunks do
-      for _=1, CHUNKS_PER_PUMP do
-        if i > #chunks then break end
-        broadcast({ cmd="CHUNK", sid=current_sid, seq=i, data=chunks[i] })
-        i = i + 1
-      end
-      coroutine.yield()
-    end
-    broadcast({ cmd="END", sid=current_sid, total=#chunks, start_epoch_ms=current_start_ms })
-  end)
-end
-
--- Control ops
-local function do_start()
-  loadTrack(); readTitle()
-  paused=false; pause_accum=0; pause_started=0
-  sid = new_sid()
-  start_ms = now_ms() + DEFAULT_DELAYMS -- 1 tick arm time
-  playing=true
-  broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=VOLUME, name=title })
-  start_streamer(sid, start_ms)
-end
-
-local function do_toggle_pause()
-  if not playing then do_start(); redraw(); return end
-  if not paused then
-    paused = true; pause_started = now_ms()
-    broadcast({ cmd="PAUSE", sid=sid })      -- hard pause on clients (speaker.stop)
-  else
-    pause_accum = pause_accum + (now_ms() - pause_started)
-    paused = false
-    broadcast({ cmd="RESUME", sid=sid })     -- immediate resume next tick
-  end
-end
-
-local function do_restart()
-  broadcast({ cmd="STOP" })                  -- instant hard stop everywhere
-  playing=false; paused=false; sid=nil; streamer=nil
-  do_start()
-end
-
--- Main
-local function main()
-  term.redirect(mon); term.setCursorBlink(false)
-  loadTrack(); readTitle()
-  local refresh = os.startTimer(0) -- tick-aligned first draw
-
-  while true do
-    -- Pump streamer aggressively each tick
-    if streamer and coroutine.status(streamer) == "suspended" then
-      for _=1, 120 do
-        if coroutine.status(streamer) ~= "suspended" then break end
-        local ok, err = coroutine.resume(streamer)
-        if not ok then streamer = nil; break end
+  while sess and (not sess.ended or (sess.total and sess.next_seq <= sess.total)) do
+    if sess.paused then
+      os.pullEvent("rednet_message")
+    else
+      local data = sess.buffer[sess.next_seq]
+      if data then
+        local decoded = decoder(data)
+        while not speaker.playAudio(decoded, sess.volume) do
+          local ev = { os.pullEvent() }
+          if ev[1] == "speaker_audio_empty" then
+          elseif not sess or sess.paused then break end
+        end
+        if not sess or sess.paused then goto cont end
+        sess.buffer[sess.next_seq] = nil
+        sess.next_seq = sess.next_seq + 1
+      else
+        local nowc = os.clock()
+        if nowc - (sess.last_nack_time or 0) >= CHUNK_REQUEST_INTERVAL then
+          send(sess.controller_id, { cmd="NACK", sid=sess.sid, seq=sess.next_seq })
+          sess.last_nack_time = nowc
+        end
+        os.pullEventTimeout("rednet_message", IDLE_WAIT)
       end
     end
-
-    local e = { os.pullEvent() }
-
-    if e[1] == "timer" and e[2] == refresh then
-      redraw()
-      refresh = os.startTimer(0.05) -- update roughly every tick
-
-    elseif e[1] == "monitor_touch" then
-      local _,_,x,y = table.unpack(e)
-      local id = ui:hit(x,y)
-      if id == "playpause" then do_toggle_pause(); redraw()
-      elseif id == "restart"  then do_restart();      redraw()
-      end
-
-    elseif e[1] == "disk" or e[1] == "disk_eject" then
-      if TRACK_PATH:match("^/disk/") and fs.exists(TRACK_PATH) then
-        loadTrack(); readTitle(); redraw()
-      end
-
-    elseif e[1] == "rednet_message" and e[4] == PROTOCOL then
-      -- NACK: resend quickly without blocking anything
-      local sender, msg = e[2], e[3]
-      if type(msg)=="table" and msg.cmd=="NACK" and msg.sid==sid then
-        local seq = tonumber(msg.seq or -1)
-        if seq and chunks[seq] then rednet.send(sender, { cmd="CHUNK", sid=sid, seq=seq, data=chunks[seq] }, PROTOCOL) end
-      end
-    end
+    ::cont::
   end
+
+  if sess then ack(sess.controller_id, "RESULT", { ok=true, info="Done" }) end
+  reset_session()
 end
 
-print("Controller UI ready (1-tick controls).")
-main()
+print("Speaker client ready (1-tick controls).")
+
+-- Main listener
+while true do
+  local sender, msg, proto = rednet.receive(PROTOCOL)
+  if proto ~= PROTOCOL or type(msg) ~= "table" then goto cont end
+
+  if msg.cmd == "PING" then
+    ack(sender, "PONG", { label=os.getComputerLabel() })
+
+  elseif msg.cmd == "PREP" then
+    reset_session()
+    begin_session(msg.sid, sender, msg.start_epoch_ms, msg.volume or 1.0)
+    ack(sender, "READY", { sid=msg.sid })
+
+  elseif msg.cmd == "CHUNK" then
+    if sess and msg.sid==sess.sid and type(msg.seq)=="number" and type(msg.data)=="string" then
+      sess.buffer[msg.seq] = msg.data
+    end
+
+  elseif msg.cmd == "END" then
+    if sess and msg.sid==sess.sid then
+      sess.ended = true; sess.total = tonumber(msg.total)
+      if msg.start_epoch_ms then sess.start_ms = tonumber(msg.start_epoch_ms) end
+      play_loop()
+    end
+
+  elseif msg.cmd == "PAUSE" then
+    if sess and msg.sid==sess.sid then
+      sess.paused = true
+      hard_stop_audio() -- immediate; clears speaker buffer
+      ack(sender, "PAUSED", { sid=sess.sid, seq=sess.next_seq })
+    end
+
+  elseif msg.cmd == "RESUME" then
+    if sess and msg.sid==sess.sid then
+      sess.paused = false -- resume immediately next tick
+      os.queueEvent("speaker_audio_empty")
+      ack(sender, "RESUMED", { sid=sess.sid, seq=sess.next_seq })
+    end
+
+  elseif msg.cmd == "STOP" then
+    hard_stop_audio(); reset_session(); ack(sender, "STOPPED")
+  end
+
+  ::cont::
+end

@@ -1,12 +1,13 @@
--- jukebox_monitor.lua (fixed)
--- Advanced monitor UI + non-blocking streamer + pause/resume/restart + live progress.
+-- jukebox_monitor.lua (streamer fixed: no sleep/pullEvent in coroutine)
+-- Advanced monitor UI + pause/resume/restart + live progress + robust streaming.
 
 -- ========= Config =========
 local PROTOCOL      = "ccaudio_sync_v1"
-local DEFAULT_DELAY = 4000            -- time for clients to prebuffer
-local CHUNK_BYTES   = 8192
+local DEFAULT_DELAY = 5000            -- extra headroom for prebuffer/sync
+local CHUNK_BYTES   = 8192            -- 4096 if your net is noisy
 local TRACK_PATH    = "/disk/music/track.dfpwm"
 local VOLUME        = 1.0
+local CHUNKS_PER_TICK = 12            -- how many chunks to push per coroutine resume
 -- ==========================
 
 -- Utils
@@ -93,8 +94,8 @@ local start_ms = 0
 local pause_accum = 0
 local pause_started = 0
 
--- streamer thread handle
-local streamer_thread = nil
+-- streamer coroutine
+local streamer = nil
 
 -- Load/Title
 local function loadTrack()
@@ -142,19 +143,21 @@ end
 
 local function new_sid() return tostring(now_ms()).."-"..tostring(math.random(1000,9999)) end
 
--- Streamer: ONLY sends CHUNKs/END and yields with sleep(0). No event pulling here.
+-- Start streamer: yields with coroutine.yield() after CHUNKS_PER_TICK sends. No sleeps.
 local function start_streamer(current_sid, current_start_ms)
-  streamer_thread = coroutine.create(function()
-    -- Push chunks
-    for i=1,#chunks do
-      broadcast({ cmd="CHUNK", sid=current_sid, seq=i, data=chunks[i] })
-      sleep(0) -- yield but don't eat events
+  streamer = coroutine.create(function()
+    local i = 1
+    while i <= #chunks do
+      for _=1, CHUNKS_PER_TICK do
+        if i > #chunks then break end
+        broadcast({ cmd="CHUNK", sid=current_sid, seq=i, data=chunks[i] })
+        i = i + 1
+      end
+      coroutine.yield()
     end
-    -- Tell clients total & the agreed start time
+    -- After all chunks, announce END with the agreed start time
     broadcast({ cmd="END", sid=current_sid, total=#chunks, start_epoch_ms=current_start_ms })
-    -- Done; thread exits.
   end)
-  coroutine.resume(streamer_thread)
 end
 
 -- Control ops
@@ -165,10 +168,10 @@ local function do_start()
   start_ms = now_ms() + DEFAULT_DELAY
   playing=true
 
-  -- Tell clients to prep
+  -- Prep clients for a future start time
   broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=VOLUME, name=title })
 
-  -- Kick off the streamer (independent coroutine)
+  -- Kick off the streamer coroutine
   start_streamer(sid, start_ms)
 end
 
@@ -187,7 +190,7 @@ end
 
 local function do_restart()
   broadcast({ cmd="STOP" }) -- clear any current playback
-  playing=false; paused=false; sid=nil
+  playing=false; paused=false; sid=nil; streamer=nil
   do_start()
 end
 
@@ -199,11 +202,21 @@ local function main()
   local refresh = os.startTimer(0.1)
 
   while true do
-    -- If streamer is alive, keep it running
-    if streamer_thread and coroutine.status(streamer_thread) == "suspended" then
-      coroutine.resume(streamer_thread)
+    -- Pump the streamer aggressively without blocking the UI
+    if streamer and coroutine.status(streamer) == "suspended" then
+      -- push multiple yields per tick so we finish quickly
+      for _=1, 30 do
+        if coroutine.status(streamer) ~= "suspended" then break end
+        local ok, err = coroutine.resume(streamer)
+        if not ok then
+          -- streamer error; stop playback state
+          streamer = nil; playing = false; paused = false
+          break
+        end
+      end
     end
 
+    -- Process one event
     local e = { os.pullEvent() }
 
     if e[1]=="monitor_touch" then
@@ -223,7 +236,7 @@ local function main()
       refresh = os.startTimer( playing and 0.1 or 0.25 )
 
     elseif e[1]=="rednet_message" and e[4]==PROTOCOL then
-      -- Handle NACKs here so the streamer never pulls events
+      -- Handle NACKs here (resend requested chunk)
       local sender,msg = e[2],e[3]
       if type(msg)=="table" and msg.cmd=="NACK" and msg.sid==sid then
         local seq = tonumber(msg.seq or -1)

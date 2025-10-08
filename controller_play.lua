@@ -1,15 +1,15 @@
 -- jukebox_monitor.lua
--- Touch UI on an ADVANCED MONITOR to control streaming, pause/resume, restart,
--- and show a live progress bar based on DFPWM length estimate.
+-- Advanced monitor UI + non-blocking streamer + pause/resume/restart + live progress.
 
 -- ========= Config =========
-local PROTOCOL = "ccaudio_sync_v1"
-local DEFAULT_DELAY = 2500           -- ms before (re)starts
-local CHUNK_BYTES = 8192             -- keep under rednet payload limits
-local TRACK_PATH = "/disk/music/track.dfpwm"  -- change if needed
+local PROTOCOL      = "ccaudio_sync_v1"
+local DEFAULT_DELAY = 4000            -- more time for clients to prebuffer
+local CHUNK_BYTES   = 8192
+local TRACK_PATH    = "/disk/music/track.dfpwm"
+local VOLUME        = 1.0
 -- ==========================
 
--- --- Helpers ---
+-- Utils
 local function openAnyModem()
   for _, side in ipairs(peripheral.getNames()) do
     if peripheral.getType(side) == "modem" then
@@ -22,7 +22,7 @@ local function findMonitor()
   local mon = peripheral.find("monitor")
   assert(mon, "No monitor attached.")
   assert(mon.isColor and mon.isColor(), "Need an ADVANCED monitor.")
-  mon.setTextScale(0.5) -- more room
+  mon.setTextScale(0.5)
   return mon
 end
 
@@ -32,100 +32,73 @@ local function findDrive()
   return drv
 end
 
-local function fmt_time(s)
-  s = math.max(0, math.floor(s + 0.5))
-  local m = math.floor(s / 60)
-  local ss = s % 60
-  return ("%d:%02d"):format(m, ss)
-end
+local function fmt_time(s) s=math.max(0,math.floor(s+0.5)); return ("%d:%02d"):format(math.floor(s/60), s%60) end
+local function basename(p) p=tostring(p):gsub("[/\\]+$",""); return p:match("([^/\\]+)$") or p end
+local function now_ms() return os.epoch("utc") end
 
-local function basename(p)
-  p = tostring(p):gsub("[/\\]+$", "")
-  return p:match("([^/\\]+)$") or p
-end
-
--- UI drawing (simple immediate mode)
+-- UI helper
 local UI = {}
 function UI.new(mon)
-  local o = { mon = mon, w=0, h=0, buttons = {} }
-  function o:resize()
-    self.w, self.h = self.mon.getSize()
-  end
-  function o:clear()
-    self.mon.setBackgroundColor(colors.black)
-    self.mon.clear()
-  end
-  function o:btn(id, label, x, y, w, h, active)
-    self.buttons[id] = {x=x,y=y,w=w,h=h}
+  local o = { mon=mon, w=0, h=0, buttons={} }
+  function o:resize() self.w,self.h = self.mon.getSize() end
+  function o:clear() self.mon.setBackgroundColor(colors.black); self.mon.clear() end
+  function o:btn(id,label,x,y,w,h,active)
+    self.buttons[id]={x=x,y=y,w=w,h=h}
     self.mon.setBackgroundColor(active and colors.lime or colors.gray)
     self.mon.setTextColor(colors.black)
-    for yy=y, y+h-1 do
-      self.mon.setCursorPos(x, yy)
-      self.mon.write((" "):rep(w))
-    end
-    local cx = x + math.floor((w - #label)/2)
-    local cy = y + math.floor(h/2)
-    self.mon.setCursorPos(cx, cy)
+    for yy=y,y+h-1 do self.mon.setCursorPos(x,yy); self.mon.write((" "):rep(w)) end
+    self.mon.setCursorPos(x+math.floor((w-#label)/2), y+math.floor(h/2))
     self.mon.write(label)
+    self.mon.setBackgroundColor(colors.black); self.mon.setTextColor(colors.white)
+  end
+  function o:bar(x,y,w,value)
+    value=math.max(0,math.min(1,value or 0))
+    local fill = math.floor(w*value+0.5)
+    self.mon.setCursorPos(x,y); self.mon.setBackgroundColor(colors.gray); self.mon.write((" "):rep(w))
+    self.mon.setCursorPos(x,y); self.mon.setBackgroundColor(colors.lightBlue); if fill>0 then self.mon.write((" "):rep(fill)) end
     self.mon.setBackgroundColor(colors.black)
   end
-  function o:bar(x, y, w, value) -- 0..1
-    value = math.max(0, math.min(1, value or 0))
-    local fill = math.floor(w * value + 0.5)
-    self.mon.setCursorPos(x, y)
-    self.mon.setBackgroundColor(colors.gray)
-    self.mon.write((" "):rep(w))
-    self.mon.setCursorPos(x, y)
-    self.mon.setBackgroundColor(colors.lightBlue)
-    if fill > 0 then self.mon.write((" "):rep(fill)) end
-    self.mon.setBackgroundColor(colors.black)
-  end
-  function o:text(x, y, msg, fg, bg)
+  function o:text(x,y,msg,fg,bg)
     if bg then self.mon.setBackgroundColor(bg) end
     if fg then self.mon.setTextColor(fg) end
-    self.mon.setCursorPos(x, y)
-    self.mon.write(msg)
-    self.mon.setTextColor(colors.white)
-    self.mon.setBackgroundColor(colors.black)
+    self.mon.setCursorPos(x,y); self.mon.write(msg)
+    self.mon.setTextColor(colors.white); self.mon.setBackgroundColor(colors.black)
   end
-  function o:hit(x, y)
+  function o:hit(x,y)
     for id,b in pairs(self.buttons) do
       if x>=b.x and y>=b.y and x<b.x+b.w and y<b.y+b.h then return id end
     end
   end
-  o:resize()
-  return o
+  o:resize(); return o
 end
 
 -- Networking
-local function count(tbl) local c=0 for _ in pairs(tbl) do c=c+1 end return c end
 local function broadcast(msg) rednet.broadcast(msg, PROTOCOL) end
-local function send(to, msg) rednet.send(to, msg, PROTOCOL) end
 
--- --- State ---
-local mon = findMonitor()
-local drive = findDrive()
-openAnyModem()
-assert(rednet.isOpen(), "No modem opened.")
+-- State
+local mon     = findMonitor()
+local drive   = findDrive()
+openAnyModem(); assert(rednet.isOpen(), "No modem opened.")
 
-local chunks = {}
-local fileBytes = 0
+local ui      = UI.new(mon)
+local chunks  = {}
+local fileLen = 0
 local durationSec = 0
-local title = "Unknown"
+local title   = "Unknown"
 
 local playing = false
-local paused = false
-local sid = nil
+local paused  = false
+local sid     = nil
 local start_ms = 0
-local pause_accum = 0      -- total ms we’ve been paused
-local pause_started = 0    -- ms when last paused began
+local pause_accum = 0
+local pause_started = 0
 
--- Load DFPWM from floppy path on the controller
+-- Load/Title
 local function loadTrack()
-  assert(fs.exists(TRACK_PATH), "Track not found: " .. TRACK_PATH)
+  assert(fs.exists(TRACK_PATH), "Track not found: "..TRACK_PATH)
   chunks = {}
-  fileBytes = fs.getSize(TRACK_PATH)
-  durationSec = (fileBytes * 8) / 48000
+  fileLen = fs.getSize(TRACK_PATH)
+  durationSec = (fileLen * 8) / 48000
   local fh = fs.open(TRACK_PATH, "rb")
   while true do
     local data = fh.read(CHUNK_BYTES)
@@ -135,170 +108,138 @@ local function loadTrack()
   fh.close()
 end
 
--- Determine title from floppy disk (label preferred)
 local function readTitle()
   local label = drive.getDiskLabel and drive.getDiskLabel() or nil
-  if label and #label > 0 then
-    title = label
-  else
-    title = basename(TRACK_PATH)
-  end
+  title = (label and #label>0) and label or basename(TRACK_PATH)
 end
 
--- Compute playhead seconds based on timing (controller-side estimate)
-local function now_ms() return os.epoch("utc") end
+-- Playhead (controller-side estimate)
 local function playhead_sec()
-  if not playing then return paused and (pause_started - start_ms - pause_accum)/1000 or 0 end
-  local base = now_ms() - start_ms - pause_accum
-  if paused then base = (pause_started - start_ms - pause_accum) end
-  return math.max(0, base / 1000)
+  if not playing then return 0 end
+  local base
+  if paused then base = (pause_started - start_ms - pause_accum)
+  else base = (now_ms() - start_ms - pause_accum) end
+  return math.max(0, base/1000)
 end
 
--- Draw UI
-local ui = UI.new(mon)
+-- UI drawing
 local function redraw()
   ui:resize(); ui:clear()
-  local w,h = ui.w, ui.h
-
-  -- Title
-  ui:text(2, 2, "Now Playing:", colors.yellow)
-  ui:text(2, 3, title, colors.white)
-
-  -- Buttons
+  local w,h=ui.w,ui.h
+  ui:text(2,2,"Now Playing:",colors.yellow)
+  ui:text(2,3,title,colors.white)
   local playLabel = paused and "Resume" or (playing and "Pause" or "Play")
-  ui:btn("playpause", playLabel, 2, 5, 10, 3, playing and not paused)
-  ui:btn("restart", "Restart", 14, 5, 10, 3, false)
-
-  -- Progress
+  ui:btn("playpause", playLabel, 2,5,10,3, playing and not paused)
+  ui:btn("restart", "Restart", 14,5,10,3, false)
   local elapsed = math.min(playhead_sec(), durationSec)
-  local pct = durationSec > 0 and (elapsed / durationSec) or 0
-  ui:text(2, 9, ("[%s / %s]"):format(fmt_time(elapsed), fmt_time(durationSec)), colors.white)
-  ui:bar(2, 10, w-3, pct)
+  local pct = durationSec>0 and (elapsed/durationSec) or 0
+  ui:text(2,9,("[%s / %s]"):format(fmt_time(elapsed), fmt_time(durationSec)), colors.white)
+  ui:bar(2,10,w-3,pct)
 end
 
--- Ping clients (optional)
-local function pingClients(short_window)
-  broadcast({ cmd = "PING" })
-  local clients = {}
-  local t = os.startTimer(short_window and 0.5 or 1.0)
-  while true do
-    local e,a,b,c = os.pullEvent()
-    if e=="timer" and a==t then break end
-    if e=="rednet_message" and c==PROTOCOL then
-      local sender, msg = a,b
-      if type(msg)=="table" and msg.cmd=="PONG" then clients[sender]=true end
-    end
-  end
-  return count(clients)
-end
+-- Session helpers
+local function new_sid() return tostring(now_ms()).."-"..tostring(math.random(1000,9999)) end
 
--- Stream the current chunks to all clients for session sid
-local function stream_all(current_sid)
+-- Streaming runs in its own coroutine and NEVER pulls arbitrary events.
+local streamer_running = false
+local function streamer(current_sid, current_start_ms)
+  streamer_running = true
+  -- push chunks
   for i=1,#chunks do
     broadcast({ cmd="CHUNK", sid=current_sid, seq=i, data=chunks[i] })
-    os.queueEvent("yield"); os.pullEvent()
+    sleep(0) -- yield without consuming events
   end
-  broadcast({ cmd="END", sid=current_sid, total=#chunks, start_epoch_ms=start_ms })
+  -- tell clients total count and start time (they wait until this)
+  broadcast({ cmd="END", sid=current_sid, total=#chunks, start_epoch_ms=current_start_ms })
+
+  -- handle NACKs for a while without blocking UI
+  local deadline = os.startTimer(10)
+  while true do
+    local e,p1,p2,p3 = os.pullEvent()
+    if e=="timer" and p1==deadline then break end
+    if e=="rednet_message" and p3==PROTOCOL then
+      local sender,msg = p1,p2
+      if type(msg)=="table" and msg.cmd=="NACK" and msg.sid==current_sid then
+        local seq = tonumber(msg.seq or -1)
+        if seq and chunks[seq] then rednet.send(sender, { cmd="CHUNK", sid=current_sid, seq=seq, data=chunks[seq] }, PROTOCOL) end
+      end
+    end
+  end
+  streamer_running = false
 end
 
--- Start (or restart) playback from the beginning
+-- Control ops
 local function do_start()
   loadTrack(); readTitle()
-  paused = false; pause_accum = 0; pause_started = 0
-  sid = tostring(now_ms()) .. "-" .. tostring(math.random(1000,9999))
+  paused=false; pause_accum=0; pause_started=0
+  sid = new_sid()
   start_ms = now_ms() + DEFAULT_DELAY
-  playing = true
+  playing=true
 
-  -- Let clients prep with the agreed start time & volume (1.0; tweak if needed)
-  broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=1.0, name=title })
+  broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=VOLUME, name=title })
 
-  -- Small window for READY (not strictly required)
-  local t = os.startTimer(0.6)
-  while true do
-    local e = { os.pullEvent() }
-    if e[1]=="timer" and e[2]==t then break end
-  end
-
-  -- Stream chunks and END
-  stream_all(sid)
+  -- fire streamer concurrently
+  parallel.waitForAny(
+    function() streamer(sid, start_ms) end,
+    function()
+      -- allow a brief READY window while the streamer starts
+      local t=os.startTimer(0.6)
+      while true do local e,a= os.pullEvent(); if e=="timer" and a==t then break end end
+    end
+  )
 end
 
--- Toggle pause/resume
 local function do_toggle_pause()
-  if not playing then
-    -- start fresh if not already playing
-    do_start()
-    return
-  end
+  if not playing then do_start(); redraw(); return end
   if not paused then
-    paused = true
-    pause_started = now_ms()
+    paused=true; pause_started = now_ms()
     broadcast({ cmd="PAUSE", sid=sid })
   else
-    -- Resume: schedule resume a smidge in the future for sync
     pause_accum = pause_accum + (now_ms() - pause_started)
-    paused = false
-    local resume_at = now_ms() + 500
-    broadcast({ cmd="RESUME", sid=sid, start_epoch_ms = resume_at })
+    paused=false
+    local resume_at = now_ms() + 1200 -- give everyone time to un-pause cleanly
+    broadcast({ cmd="RESUME", sid=sid, start_epoch_ms=resume_at })
   end
 end
 
--- Restart from beginning
 local function do_restart()
-  -- Tell clients to STOP existing session (optional cleanup), then start fresh
-  broadcast({ cmd="STOP" })
-  playing = false; paused = false; sid = nil
+  broadcast({ cmd="STOP" }) -- clear any current playback
+  playing=false; paused=false; sid=nil
   do_start()
 end
 
--- Main: initial load + UI loop
+-- Main
 local function main()
-  term.redirect(mon)
-  term.setCursorBlink(false)
+  term.redirect(mon); term.setCursorBlink(false)
+  loadTrack(); readTitle(); redraw()
 
-  -- Initial content & UI
-  loadTrack(); readTitle()
-  redraw()
-
-  -- Optional: ping to show clients up
-  pingClients(true)
-  redraw()
-
-  -- Background timer to refresh progress bar
-  local refresh = os.startTimer(0.2)
-
+  -- UI + timers + net handling loop (never blocked by streaming)
+  local refresh = os.startTimer(0.1)
   while true do
     local e = { os.pullEvent() }
-    if e[1] == "monitor_touch" then
-      local _, _, x, y = table.unpack(e)
-      local id = ui:hit(x, y)
-      if id == "playpause" then
-        do_toggle_pause()
-        redraw()
-      elseif id == "restart" then
-        do_restart()
-        redraw()
+
+    if e[1]=="monitor_touch" then
+      local _,_,x,y = table.unpack(e)
+      local id = ui:hit(x,y)
+      if id=="playpause" then do_toggle_pause(); redraw()
+      elseif id=="restart" then do_restart(); redraw()
       end
 
-    elseif e[1] == "disk" or e[1] == "disk_eject" then
-      -- Floppy changed; reload if our TRACK_PATH is on /disk
+    elseif e[1]=="disk" or e[1]=="disk_eject" then
       if TRACK_PATH:match("^/disk/") and fs.exists(TRACK_PATH) then
-        loadTrack(); readTitle()
-        redraw()
+        loadTrack(); readTitle(); redraw()
       end
 
-    elseif e[1] == "timer" and e[2] == refresh then
+    elseif e[1]=="timer" and e[2]==refresh then
       redraw()
-      refresh = os.startTimer(0.2)
+      refresh = os.startTimer( playing and 0.1 or 0.25 )
 
-    elseif e[1] == "rednet_message" then
-      -- Optionally handle RESULT/PAUSED/RESUMED logs; not required for UI
-      -- local sender, msg, proto = e[2], e[3], e[4]
-      -- (left silent to keep UI snappy)
+    elseif e[1]=="rednet_message" then
+      -- Optional: log RESULT/PAUSED/RESUMED if you like
+      -- local sender,msg,proto = e[2],e[3],e[4]
     end
   end
 end
 
--- Ensure modem is open and monitor is ready, then go.
-print("Controller UI ready on monitor. Touch Play/Pause or Restart.")
+print("Controller UI ready. Use the monitor to Play/Pause or Restart.")
 main()

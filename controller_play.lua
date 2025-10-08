@@ -1,8 +1,9 @@
--- controller_play.lua
+-- controller_stream.lua
+-- Streams a .dfpwm file from the controller's disk drive to all clients.
 -- Usage:
---   controller_play <path_on_clients> [delay_ms] [volume]
+--   controller_stream <path_on_controller> [delay_ms] [volume] [chunk_bytes]
 -- Example:
---   controller_play /disk/music/track.dfpwm 2500 0.8
+--   controller_stream /disk/music/track.dfpwm 2500 0.9 8192
 
 local PROTOCOL = "ccaudio_sync_v1"
 
@@ -14,62 +15,108 @@ local function openAnyModem()
   end
 end
 
-openAnyModem()
-assert(rednet.isOpen(), "No modem found/opened. Attach and open a (wired) modem.")
+local function basename(p)
+  return (tostring(p):gsub("[/\\]+$", "")):match("([^/\\]+)$") or tostring(p)
+end
 
-local tArgs = { ... }
-if #tArgs < 1 then
-  print("Usage: controller_play <path_on_clients> [delay_ms] [volume]")
+openAnyModem()
+assert(rednet.isOpen(), "No modem found/opened. Attach/open a (wired) modem.")
+
+local args = { ... }
+if #args < 1 then
+  print("Usage: controller_stream <path_on_controller> [delay_ms] [volume] [chunk_bytes]")
   return
 end
 
-local path   = tArgs[1]
-local delay  = tonumber(tArgs[2]) or 2000  -- default start 2s from now
-local volume = tonumber(tArgs[3]) or 1.0
+local path = args[1]
+local delay = tonumber(args[2]) or 2500
+local volume = tonumber(args[3]) or 1.0
+local CHUNK = tonumber(args[4]) or 8192  -- keep under rednet payload limits
 
--- Optional: ping to see how many clients are alive
+assert(fs.exists(path), "File not found: " .. path)
+local fh = fs.open(path, "rb")
+assert(fh, "Failed to open file")
+
+-- Load into memory so we can handle retransmits reliably
+local chunks = {}
+while true do
+  local data = fh.read(CHUNK)
+  if not data then break end
+  chunks[#chunks+1] = data
+end
+fh.close()
+
+local function count(tbl) local c=0 for _ in pairs(tbl) do c=c+1 end return c end
+
+-- Ping to see who's alive (optional)
 rednet.broadcast({ cmd = "PING" }, PROTOCOL)
 local clients = {}
-local ping_deadline = os.startTimer(0.7) -- short window to collect pongs
+local ping_deadline = os.startTimer(0.7)
 while true do
   local e, p1, p2, p3 = os.pullEvent()
-  if e == "timer" and p1 == ping_deadline then
-    break
-  elseif e == "rednet_message" then
-    local sender, msg, proto = p1, p2, p3
-    if proto == PROTOCOL and type(msg) == "table" and msg.cmd == "PONG" then
+  if e == "timer" and p1 == ping_deadline then break end
+  if e == "rednet_message" and p3 == PROTOCOL then
+    local sender, msg = p1, p2
+    if type(msg) == "table" and msg.cmd == "PONG" then
       clients[sender] = msg.label or ("#" .. tostring(sender))
     end
   end
 end
+print(("Clients responding: %d"):format(count(clients)))
 
-print(("Clients responding: %d"):format((function(t) local c=0 for _ in pairs(t) do c=c+1 end return c end)(clients)))
+-- Prepare a unique session id
+local sid = tostring(os.epoch("utc")) .. "-" .. tostring(math.random(1000,9999))
+local start_ms = os.epoch("utc") + math.max(500, delay)
 
--- Compute the shared start time (UTC ms)
-local start_epoch_ms = os.epoch("utc") + math.max(250, delay)
+-- Tell everyone to prepare (gives them the exact start time)
+local prep = { cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=volume, name=basename(path) }
+rednet.broadcast(prep, PROTOCOL)
+print(("PREP sent for %s; start in %d ms"):format(prep.name, start_ms - os.epoch("utc")))
 
--- Broadcast the PLAY command
-local payload = { cmd = "PLAY", path = path, start_epoch_ms = start_epoch_ms, volume = volume }
-rednet.broadcast(payload, PROTOCOL)
-print(("Sent PLAY for %s at %d (in %d ms, vol=%.2f)")
-  :format(path, start_epoch_ms, start_epoch_ms - os.epoch("utc"), volume))
-
--- Collect results (optional)
-local results_deadline = os.startTimer(10)
-local received = 0
+-- Brief window to collect READY acks (optional)
+local ready_deadline = os.startTimer(0.7)
 while true do
   local e, p1, p2, p3 = os.pullEvent()
-  if e == "timer" and p1 == results_deadline then
-    break
-  elseif e == "rednet_message" then
-    local sender, msg, proto = p1, p2, p3
-    if proto == PROTOCOL and type(msg) == "table" and msg.cmd == "RESULT" then
-      received = received + 1
-      local label = clients[sender] or ("#" .. tostring(sender))
-      print(("[%s] %s (%s)"):format(label, msg.ok and "OK" or "ERR", msg.info or ""))
-    elseif proto == PROTOCOL and type(msg) == "table" and msg.cmd == "ERROR" then
-      local label = clients[sender] or ("#" .. tostring(sender))
-      print(("[%s] ERROR: %s"):format(label, msg.error or ""))
+  if e == "timer" and p1 == ready_deadline then break end
+  if e == "rednet_message" and p3 == PROTOCOL then
+    local sender, msg = p1, p2
+    if type(msg) == "table" and msg.cmd == "READY" and msg.sid == sid then
+      clients[sender] = clients[sender] or ("#" .. tostring(sender))
     end
   end
 end
+
+-- Stream all chunks
+for i=1, #chunks do
+  rednet.broadcast({ cmd="CHUNK", sid=sid, seq=i, data=chunks[i] }, PROTOCOL)
+  -- tiny yield so receivers can process
+  os.queueEvent("yield"); os.pullEvent()
+end
+
+-- Notify end and total count
+rednet.broadcast({ cmd="END", sid=sid, total=#chunks }, PROTOCOL)
+print(("END sent (%d chunks). Waiting for NACKs/results…"):format(#chunks))
+
+-- Simple NACK/Result handling window
+local finish_deadline = os.startTimer(12) -- allow time for late NACKs & playback
+while true do
+  local e, p1, p2, p3 = os.pullEvent()
+  if e == "timer" and p1 == finish_deadline then break end
+  if e == "rednet_message" and p3 == PROTOCOL then
+    local sender, msg = p1, p2
+    if type(msg) == "table" then
+      if msg.cmd == "NACK" and msg.sid == sid and type(msg.seq) == "number" then
+        local seq = msg.seq
+        local data = chunks[seq]
+        if data then
+          rednet.send(sender, { cmd="CHUNK", sid=sid, seq=seq, data=data }, PROTOCOL)
+        end
+      elseif msg.cmd == "RESULT" then
+        local label = clients[sender] or ("#" .. tostring(sender))
+        print(("[%s] %s (%s)"):format(label, msg.ok and "OK" or "ERR", msg.info or ""))
+      end
+    end
+  end
+end
+
+print("Stream session complete.")

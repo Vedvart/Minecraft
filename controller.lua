@@ -1,4 +1,4 @@
--- jukebox_monitor.lua  (1-tick control path)
+-- jukebox_monitor.lua  (1-tick control path, syntax fixed)
 -- Advanced monitor UI with near-instant Play/Pause/Restart and tick-rate progress.
 
 -- ===== Config =====
@@ -63,17 +63,16 @@ function UI.new(mon)
   o:resize(); return o
 end
 
--- State
+-- State (FIXED multi-assignment syntax)
 local mon = findMonitor()
 local drive = findDrive()
 openAnyModem(); assert(rednet.isOpen(), "No modem open")
 
 local ui = UI.new(mon)
-local chunks={}, fileBytes=0, durationSec=0, title="Unknown"
-
-local playing=false, paused=false
-local sid=nil, start_ms=0
-local pause_accum=0, pause_started=0
+local chunks, fileBytes, durationSec, title = {}, 0, 0, "Unknown"
+local playing, paused = false, false
+local sid, start_ms = nil, 0
+local pause_accum, pause_started = 0, 0
 
 -- streamer coroutine (non-blocking; yields manually)
 local streamer = nil
@@ -142,10 +141,10 @@ end
 -- Control ops
 local function do_start()
   loadTrack(); readTitle()
-  paused=false; pause_accum=0; pause_started=0
+  paused, pause_accum, pause_started = false, 0, 0
   sid = new_sid()
   start_ms = now_ms() + DEFAULT_DELAYMS -- 1 tick arm time
-  playing=true
+  playing = true
   broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=VOLUME, name=title })
   start_streamer(sid, start_ms)
 end
@@ -153,7 +152,7 @@ end
 local function do_toggle_pause()
   if not playing then do_start(); redraw(); return end
   if not paused then
-    paused = true; pause_started = now_ms()
+    paused, pause_started = true, now_ms()
     broadcast({ cmd="PAUSE", sid=sid })      -- hard pause on clients (speaker.stop)
   else
     pause_accum = pause_accum + (now_ms() - pause_started)
@@ -164,7 +163,7 @@ end
 
 local function do_restart()
   broadcast({ cmd="STOP" })                  -- instant hard stop everywhere
-  playing=false; paused=false; sid=nil; streamer=nil
+  playing, paused, sid, streamer = false, false, nil, nil
   do_start()
 end
 
@@ -179,7 +178,7 @@ local function main()
     if streamer and coroutine.status(streamer) == "suspended" then
       for _=1, 120 do
         if coroutine.status(streamer) ~= "suspended" then break end
-        local ok, err = coroutine.resume(streamer)
+        local ok = coroutine.resume(streamer)
         if not ok then streamer = nil; break end
       end
     end

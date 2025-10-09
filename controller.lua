@@ -1,34 +1,34 @@
--- jukebox_monitor.lua  (DEBUG build; 1-tick control, verbose logs)
-
--- ===== Config =====
+-- jukebox_monitor.lua  (DEBUG build; logs to terminal + /controller.log)
 local PROTOCOL        = "ccaudio_sync_v1"
-local DEFAULT_DELAYMS = 50           -- 1 tick arm time
-local CHUNK_BYTES     = 64           -- tiny chunks for fast control
-local CHUNKS_PER_PUMP = 128          -- push many per pump
+local DEFAULT_DELAYMS = 50
+local CHUNK_BYTES     = 64
+local CHUNKS_PER_PUMP = 128
 local TRACK_PATH      = "/disk/music/track.dfpwm"
 local VOLUME          = 1.0
 local DEBUG           = true
--- ===================
+local LOG_PATH        = "/controller.log"
 
 -- ===== Utils =====
 local function now_ms() return os.epoch("utc") end
 local function t() return ("%d"):format(now_ms() % 1000000) end
-local function log(...) if DEBUG then print(("[%s][CTRL ] "):format(t()) .. table.concat({...}," ")) end end
+local native = term.native()
+local function log_write(s)
+  -- mirror to native terminal
+  local old = term.current()
+  term.redirect(native); print(s); term.redirect(old)
+  -- append to file
+  local fh = fs.open(LOG_PATH, "a"); if fh then fh.writeLine(s); fh.close() end
+end
+local function log(...) if DEBUG then log_write(("[%s][CTRL ] "):format(t()) .. table.concat({...}," ")) end end
 local function broadcast(msg) rednet.broadcast(msg, PROTOCOL) end
 
 local function openAnyModem()
-  for _, side in ipairs(peripheral.getNames()) do
-    if peripheral.getType(side) == "modem" then
-      if not rednet.isOpen(side) then rednet.open(side) end
-    end
+  for _, s in ipairs(peripheral.getNames()) do
+    if peripheral.getType(s) == "modem" and not rednet.isOpen(s) then rednet.open(s) end
   end
 end
-local function findMonitor()
-  local mon = peripheral.find("monitor")
-  assert(mon, "No monitor attached"); assert(mon.isColor and mon.isColor(), "Advanced monitor required")
-  mon.setTextScale(0.5); return mon
-end
-local function findDrive() local d=peripheral.find("drive"); assert(d,"No disk drive attached"); return d end
+local function findMonitor() local m=peripheral.find("monitor"); assert(m,"No monitor"); assert(m.isColor and m.isColor(),"Need advanced monitor"); m.setTextScale(0.5); return m end
+local function findDrive() local d=peripheral.find("drive"); assert(d,"No disk drive"); return d end
 local function fmt_time(s) s=math.max(0,math.floor(s+0.5)); return ("%d:%02d"):format(math.floor(s/60), s%60) end
 local function basename(p) p=tostring(p):gsub("[/\\]+$",""); return p:match("([^/\\]+)$") or p end
 
@@ -75,21 +75,14 @@ local playing, paused = false, false
 local sid, start_ms = nil, 0
 local pause_accum, pause_started = 0, 0
 local streamer = nil
-local last_chunk_sent = 0
-local sent_started_ms = 0
+local last_chunk_sent, sent_started_ms = 0, 0
 
 -- ===== Load / Title =====
 local function loadTrack()
   assert(fs.exists(TRACK_PATH), "Track not found: "..TRACK_PATH)
-  chunks = {}
-  fileBytes = fs.getSize(TRACK_PATH)
-  durationSec = (fileBytes * 8) / 48000
+  chunks = {}; fileBytes = fs.getSize(TRACK_PATH); durationSec = (fileBytes * 8) / 48000
   local fh = fs.open(TRACK_PATH, "rb")
-  while true do
-    local data = fh.read(CHUNK_BYTES)
-    if not data then break end
-    chunks[#chunks+1] = data
-  end
+  while true do local d = fh.read(CHUNK_BYTES); if not d then break end; chunks[#chunks+1] = d end
   fh.close()
   log("track loaded bytes=", tostring(fileBytes), " chunks=", tostring(#chunks))
 end
@@ -99,11 +92,10 @@ local function readTitle()
   log("title=", title)
 end
 
--- ===== Playhead/Redraw =====
+-- ===== Playhead/UI =====
 local function playhead_sec()
   if not playing then return 0 end
-  local base = paused and (pause_started - start_ms - pause_accum)
-                or (now_ms() - start_ms - pause_accum)
+  local base = paused and (pause_started - start_ms - pause_accum) or (now_ms() - start_ms - pause_accum)
   return math.max(0, base/1000)
 end
 local function redraw()
@@ -123,8 +115,7 @@ local function new_sid() return tostring(now_ms()).."-"..tostring(math.random(10
 
 -- ===== Streamer =====
 local function start_streamer(current_sid, current_start_ms)
-  last_chunk_sent = 0
-  sent_started_ms = now_ms()
+  last_chunk_sent = 0; sent_started_ms = now_ms()
   streamer = coroutine.create(function()
     log("stream begin sid=", current_sid, " start_ms=", tostring(current_start_ms))
     local i=1
@@ -149,7 +140,6 @@ end
 
 local function pump_streamer()
   if streamer and coroutine.status(streamer) == "suspended" then
-    -- Pump hard each tick
     for _=1, 200 do
       if coroutine.status(streamer) ~= "suspended" then break end
       local ok, err = coroutine.resume(streamer)
@@ -165,7 +155,7 @@ local function do_start()
   sid = new_sid()
   start_ms = now_ms() + DEFAULT_DELAYMS
   playing = true
-  log("PLAY pressed -> PREP sid=", sid, " start_in_ms=", tostring(start_ms - now_ms()), " chunks=", tostring(#chunks))
+  log("PLAY -> PREP sid=", sid, " start_in_ms=", tostring(start_ms - now_ms()), " chunks=", tostring(#chunks))
   broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=VOLUME, name=title })
   start_streamer(sid, start_ms)
 end
@@ -173,17 +163,17 @@ local function do_toggle_pause()
   if not playing then do_start(); redraw(); return end
   if not paused then
     paused, pause_started = true, now_ms()
-    log("PAUSE pressed")
+    log("PAUSE")
     broadcast({ cmd="PAUSE", sid=sid })
   else
     pause_accum = pause_accum + (now_ms() - pause_started)
     paused = false
-    log("RESUME pressed")
+    log("RESUME")
     broadcast({ cmd="RESUME", sid=sid })
   end
 end
 local function do_restart()
-  log("RESTART pressed")
+  log("RESTART")
   broadcast({ cmd="STOP" })
   playing, paused, sid, streamer = false, false, nil, nil
   do_start()
@@ -191,27 +181,23 @@ end
 
 -- ===== Main =====
 local function main()
+  print("Controller UI (DEBUG) starting… (logs mirrored to /controller.log)")
   term.redirect(mon); term.setCursorBlink(false)
   loadTrack(); readTitle(); redraw()
-  log("UI ready. Tap Play.")
 
   local refresh = os.startTimer(0)
-
   while true do
     pump_streamer()
-
-    -- non-blocking receive (~tick rate)
     local ev = { os.pullEvent() }
 
     if ev[1]=="timer" and ev[2]==refresh then
-      redraw()
-      refresh = os.startTimer(0.05)
+      redraw(); refresh = os.startTimer(0.05)
 
     elseif ev[1]=="monitor_touch" then
       local _,_,x,y = table.unpack(ev)
-      local id = UI.hit and UI.hit(ui, x, y) or (ui.hit and ui:hit(x,y))
+      local id = UI.hit and UI.hit(ui,x,y) or (ui.hit and ui:hit(x,y))
       if id=="playpause" then do_toggle_pause(); redraw()
-      elseif id=="restart" then do_restart(); redraw()
+      elseif id=="restart"  then do_restart();      redraw()
       end
 
     elseif ev[1]=="disk" or ev[1]=="disk_eject" then
@@ -226,21 +212,15 @@ local function main()
             rednet.send(sender, { cmd="CHUNK", sid=sid, seq=seq, data=chunks[seq] }, PROTOCOL)
             if seq % 500 == 0 or seq < 10 then log("resend seq=", tostring(seq), " to #", tostring(sender)) end
           end
-        elseif msg.cmd=="READY" then
-          log("READY from #", tostring(sender), " sid=", tostring(msg.sid))
-        elseif msg.cmd=="PAUSED" then
-          log("PAUSED ack from #", tostring(sender), " seq=", tostring(msg.seq))
-        elseif msg.cmd=="RESUMED" then
-          log("RESUMED ack from #", tostring(sender), " seq=", tostring(msg.seq))
-        elseif msg.cmd=="RESULT" then
-          log("RESULT from #", tostring(sender), " ok=", tostring(msg.ok), " info=", tostring(msg.info))
-        elseif msg.cmd=="PONG" then
-          log("PONG from #", tostring(sender))
+        elseif msg.cmd=="READY"   then log("READY  from #", tostring(sender), " sid=", tostring(msg.sid))
+        elseif msg.cmd=="PAUSED"  then log("PAUSED ack from #", tostring(sender), " seq=", tostring(msg.seq))
+        elseif msg.cmd=="RESUMED" then log("RESUMED ack from #", tostring(sender), " seq=", tostring(msg.seq))
+        elseif msg.cmd=="RESULT"  then log("RESULT from #", tostring(sender), " ok=", tostring(msg.ok), " info=", tostring(msg.info))
+        elseif msg.cmd=="PONG"    then log("PONG from #", tostring(sender))
         end
       end
     end
   end
 end
 
-print("Controller UI (DEBUG) starting…")
 main()

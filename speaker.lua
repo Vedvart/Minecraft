@@ -1,175 +1,200 @@
--- speaker_client_stream.lua  (DEBUG+LOG; 1-tick controls; watchdog force-start)
-local PROTOCOL = "ccaudio_sync_v1"
-local DEBUG = true
-local LOG_PATH = "/speaker.log"
+-- speaker.lua
+-- Runs on each speaker computer. Caches audio from controller, then
+-- plays/pauses/restarts in tight sync using start_at (epoch ms) targets.
 
--- Low-latency tuning
-local CHUNK_REQUEST_INTERVAL = 0.10  -- seconds
-local PREBUFFER_TARGET = 1           -- start once 1 chunk exists
-local IDLE_WAIT = 0.02               -- seconds
-local FORCE_START_BUF = 32           -- if ≥ this many chunks buffered, force start
-local FORCE_START_MS  = 3000         -- or if waiting > this long since PREP, force start
+local PROTOCOL = "ccsync_audio_v1"
+local CACHE_DIR = "/music_cache"
+local CACHE_FILE = fs.combine(CACHE_DIR, "track.dfpwm")
 
--- ===== Utilities =====
-local function now_ms() return os.epoch("utc") end
-local function t() return ("%d"):format(now_ms() % 1000000) end
+-- Peripherals
+local spk = peripheral.find("speaker")
+if not spk then error("No speaker attached.") end
 
-local native = term.native()
-local function log_line(s)
-  local old = term.current()
-  term.redirect(native); print(s); term.redirect(old)
-  local fh = fs.open(LOG_PATH, "a"); if fh then fh.writeLine(s); fh.close() end
-end
-local function log(...) if DEBUG then log_line(("[%s][CLIENT] "):format(t()) .. table.concat({...}," ")) end end
-
--- Tiny “pull with timeout”
-local function pull_with_timeout(filter, timeout)
-  local timer = os.startTimer(timeout or 0)
-  while true do
-    local e, p1, p2, p3 = os.pullEvent()
-    if e == "timer" and p1 == timer then return nil end
-    if not filter or e == filter then return e, p1, p2, p3 end
-  end
+local modem = peripheral.find("modem")
+if not modem then error("No modem attached.") end
+if not peripheral.call(peripheral.getName(modem), "isOpen", 0) then
+  rednet.open(peripheral.getName(modem))
 end
 
--- Open modem
-for _, s in ipairs(peripheral.getNames()) do
-  if peripheral.getType(s) == "modem" and not rednet.isOpen(s) then rednet.open(s) end
-end
-assert(rednet.isOpen(), "No modem open")
-
-local speaker = peripheral.find("speaker"); assert(speaker, "No speaker")
+-- decoder
 local dfpwm = require("cc.audio.dfpwm")
 
--- ===== Session =====
-local sess = nil
-local function send(to, msg) if to then rednet.send(to, msg, PROTOCOL) end end
-local function ack(to, cmd, extra) local m={cmd=cmd,id=os.getComputerID()}; if extra then for k,v in pairs(extra) do m[k]=v end end; send(to,m) end
-local function hard_stop_audio() if speaker.stop then pcall(function() speaker.stop() end) end; os.queueEvent("speaker_audio_empty") end
+-- State
+local playing = false
+local playThread = nil
+local wantStop = false
+local currentOffset = 0 -- byte offset into file
 
-local function begin_session(sid, controller_id, start_ms, volume)
-  sess = {
-    sid=sid, controller_id=controller_id, start_ms=tonumber(start_ms) or now_ms(),
-    volume=tonumber(volume) or 1.0, buffer={}, next_seq=1, ended=false, total=nil,
-    paused=false, last_nack_time=0, player_task=nil, prep_ms=now_ms(), started=false,
-  }
+-- Utility
+local function now() return os.epoch("utc") end
+
+local function safeStop()
+  -- Stop speaker immediately (clear buffered audio)
+  pcall(function() spk.stop() end)
+  wantStop = true
+  playing = false
+  playThread = nil
 end
 
--- ===== Player =====
-local function buf_len()
-  local c=0; for _ in pairs(sess.buffer) do c=c+1 end; return c
+local function roundDownToChunk(b, chunk)
+  return math.floor(b / chunk) * chunk
 end
 
-local function player_loop()
-  log("player_loop enter; start_ms=", tostring(sess.start_ms))
-
-  -- Arm until start time OR watchdog trips
-  while sess do
-    if now_ms() + 1 >= sess.start_ms and (sess.buffer[sess.next_seq] ~= nil) then break end
-    -- Watchdog: if we’ve been waiting a while or have lots buffered, force start
-    if (now_ms() - (sess.prep_ms or now_ms())) > FORCE_START_MS or buf_len() >= FORCE_START_BUF then
-      if now_ms() < sess.start_ms then log("WATCHDOG: force start (buf=", tostring(buf_len()), ")"); end
-      sess.start_ms = now_ms() - 1
-      break
+-- Playback coroutine
+local function makePlayer(startEpoch, offsetBytes)
+  return coroutine.create(function()
+    local chunkSize = 16*1024
+    local fh = fs.open(CACHE_FILE, "rb")
+    if not fh then
+      -- no cache, can't play
+      return
     end
-    pull_with_timeout(nil, 0.01)
-  end
-  if not sess then return end
 
-  log("starting playback; next_seq=", tostring(sess.next_seq))
-  sess.started = true
-  local decoder = dfpwm.make_decoder()
+    -- seek to requested offset (rounded to chunk for speed/consistency)
+    local seekOffset = roundDownToChunk(offsetBytes or 0, chunkSize)
+    fh.seek("set", seekOffset)
+    currentOffset = seekOffset
 
-  while sess and (not sess.ended or (sess.total and sess.next_seq <= sess.total)) do
-    if sess.paused then
-      pull_with_timeout("rednet_message", 0.1)
-    else
-      local data = sess.buffer[sess.next_seq]
-      if data then
-        local decoded = decoder(data)
-        while not speaker.playAudio(decoded, sess.volume) do
-          local e = { os.pullEvent() }
-          if e[1] == "speaker_audio_empty" then
-          elseif not sess or sess.paused then break end
+    local decoder = dfpwm.make_decoder()
+
+    -- wait until the scheduled start moment
+    while now() < (startEpoch or now()) do
+      os.pullEvent("timer") -- yield lightly until the time passes
+    end
+
+    playing = true
+    wantStop = false
+
+    while not wantStop do
+      local enc = fh.read(chunkSize)
+      if not enc then break end
+      currentOffset = currentOffset + #enc
+
+      local buf = decoder(enc)
+      -- Push to speaker, block until buffer has room
+      while not spk.playAudio(buf) do
+        local ev = { os.pullEvent() }
+        if ev[1] == "speaker_audio_empty" then
+          -- ok keep looping
+        elseif ev[1] == "rednet_message" then
+          -- Let control messages preempt promptly
+          local from, msg, proto = ev[2], ev[3], ev[4]
+          if proto == PROTOCOL and type(msg)=="table" then
+            if msg.type == "pause" then
+              safeStop()
+              fh.close()
+              return
+            elseif msg.type == "restart" then
+              safeStop()
+              fh.close()
+              -- Controller will immediately follow with a play start, so exit
+              return
+            end
+          end
+        elseif ev[1] == "terminate" then
+          fh.close(); return
         end
-        if not sess or sess.paused then goto cont end
-        sess.buffer[sess.next_seq] = nil
-        sess.next_seq = sess.next_seq + 1
-        if sess.next_seq % 2048 == 0 then log("played up to seq=", tostring(sess.next_seq-1)) end
-      else
-        local nowc = os.clock()
-        if nowc - (sess.last_nack_time or 0) >= CHUNK_REQUEST_INTERVAL then
-          send(sess.controller_id, { cmd="NACK", sid=sess.sid, seq=sess.next_seq })
-          sess.last_nack_time = nowc
-          log("NACK seq=", tostring(sess.next_seq))
-        end
-        pull_with_timeout("rednet_message", IDLE_WAIT)
+        if wantStop then fh.close(); return end
       end
-    end
-    ::cont::
-  end
 
-  if sess then
-    log("playback finished at seq=", tostring(sess.next_seq-1), " total=", tostring(sess.total))
-    ack(sess.controller_id, "RESULT", { ok=true, info="Done" })
-  end
-end
-
-local function ensure_player_running()
-  if not sess then return end
-  if not sess.player_task or coroutine.status(sess.player_task) == "dead" then
-    sess.player_task = coroutine.create(player_loop)
-    log("player_task created")
-  end
-end
-local function pump_player()
-  if sess and sess.player_task and coroutine.status(sess.player_task) == "suspended" then
-    local ok, err = coroutine.resume(sess.player_task)
-    if not ok then log("player_task error: ", tostring(err)) end
-  end
-end
-
-print("Speaker client ready (DEBUG+LOG). See "..LOG_PATH)
-
--- ===== Main =====
-while true do
-  pump_player()
-  local sender, msg, proto = rednet.receive(PROTOCOL, 0.05)
-  pump_player()
-
-  if not sender or proto ~= PROTOCOL or type(msg) ~= "table" then goto cont end
-
-  if msg.cmd == "PREP" then
-    log("PREP sid=", tostring(msg.sid), " start_ms=", tostring(msg.start_epoch_ms), " vol=", tostring(msg.volume))
-    begin_session(msg.sid, sender, msg.start_epoch_ms, msg.volume or 1.0)
-    ack(sender, "READY", { sid = msg.sid })
-    ensure_player_running()
-
-  elseif msg.cmd == "CHUNK" then
-    if sess and msg.sid == sess.sid and type(msg.seq) == "number" and type(msg.data) == "string" then
-      sess.buffer[msg.seq] = msg.data
-      if (msg.seq & 0xff) == 0 or msg.seq <= 16 then
-        log("CHUNK seq=", tostring(msg.seq), " buf≈", tostring(buf_len()))
+      -- Let other events in; check pause/restart quickly
+      local e = { os.pullEventRaw() }
+      if e[1] == "rednet_message" then
+        local from, msg, proto = e[2], e[3], e[4]
+        if proto == PROTOCOL and type(msg)=="table" then
+          if msg.type == "pause" then
+            safeStop(); fh.close(); return
+          elseif msg.type == "restart" then
+            safeStop(); fh.close(); return
+          end
+        end
+      elseif e[1] == "terminate" then
+        fh.close(); return
       end
     end
 
-  elseif msg.cmd == "END" then
-    if sess and msg.sid == sess.sid then
-      sess.ended = true; sess.total = tonumber(msg.total)
-      if msg.start_epoch_ms then sess.start_ms = tonumber(msg.start_epoch_ms) end
-      log("END total=", tostring(sess.total), " start_ms=", tostring(sess.start_ms))
-      ensure_player_running()
-    end
-
-  elseif msg.cmd == "PAUSE" and sess and msg.sid == sess.sid then
-    log("PAUSE"); sess.paused = true; hard_stop_audio(); ack(sender,"PAUSED",{sid=sess.sid,seq=sess.next_seq})
-
-  elseif msg.cmd == "RESUME" and sess and msg.sid == sess.sid then
-    log("RESUME at seq=", tostring(sess.next_seq)); sess.paused=false; os.queueEvent("speaker_audio_empty"); ack(sender,"RESUMED",{sid=sess.sid,seq=sess.next_seq})
-
-  elseif msg.cmd == "STOP" then
-    log("STOP"); hard_stop_audio(); sess = nil; ack(sender,"STOPPED")
-  end
-
-  ::cont::
+    fh.close()
+    playing = false
+  end)
 end
+
+-- Respond to controller hello so we can be discovered
+local function announce()
+  rednet.broadcast({type="speaker_here"}, PROTOCOL)
+end
+
+-- Handle caching
+local function handleCache()
+  if not fs.exists(CACHE_DIR) then fs.makeDir(CACHE_DIR) end
+
+  local name, expectSize, written, fh = nil, nil, 0, nil
+  local timerId = nil
+
+  while true do
+    local ev = { os.pullEvent() }
+    if ev[1]=="rednet_message" then
+      local id,msg,proto = ev[2],ev[3],ev[4]
+      if proto==PROTOCOL and type(msg)=="table" then
+        if msg.type=="cache_begin" then
+          name = msg.name or "track.dfpwm"
+          expectSize = msg.size
+          if fh then fh.close() end
+          if fs.exists(CACHE_FILE) then fs.delete(CACHE_FILE) end
+          fh = fs.open(CACHE_FILE, "wb")
+          written = 0
+          -- set a guard timer in case stream stalls
+          if timerId then os.cancelTimer(timerId) end
+          timerId = os.startTimer(10)
+        elseif msg.type=="cache_chunk" and fh then
+          fh.write(msg.data)
+          written = written + #msg.data
+          if timerId then os.cancelTimer(timerId) end
+          timerId = os.startTimer(10)
+        elseif msg.type=="cache_end" and fh then
+          fh.close(); fh=nil
+          if expectSize and fs.getSize(CACHE_FILE)==expectSize then
+            rednet.send(ev[2], {type="cache_ok"}, PROTOCOL)
+          else
+            -- size mismatch; drop file
+            if fs.exists(CACHE_FILE) then fs.delete(CACHE_FILE) end
+          end
+          timerId = nil
+        elseif msg.type=="play" then
+          -- Stop any current playback and start fresh at scheduled time
+          safeStop()
+          local startAt = msg.start_at or now()
+          local off = msg.offset or 0
+          playThread = makePlayer(startAt, off)
+          if playThread then coroutine.resume(playThread) end
+        elseif msg.type=="pause" then
+          safeStop()
+          -- keep currentOffset so controller can roughly align on resume
+        elseif msg.type=="restart" then
+          safeStop()
+          local startAt = msg.start_at or now()
+          playThread = makePlayer(startAt, 0)
+          if playThread then coroutine.resume(playThread) end
+        end
+      end
+    elseif ev[1]=="timer" and timerId and ev[2]==timerId then
+      -- cache timeout
+      if fh then fh.close(); fh=nil end
+      timerId = nil
+    elseif ev[1]=="terminate" then
+      if fh then fh.close() end
+      return
+    end
+  end
+end
+
+-- Start
+announce()
+-- also re-announce periodically so late controllers see us
+local function announcer()
+  while true do
+    announce()
+    os.sleep(2)
+  end
+end
+
+parallel.waitForAny(announcer, handleCache)

@@ -1,226 +1,301 @@
--- jukebox_monitor.lua  (DEBUG build; logs to terminal + /controller.log)
-local PROTOCOL        = "ccaudio_sync_v1"
-local DEFAULT_DELAYMS = 50
-local CHUNK_BYTES     = 64
-local CHUNKS_PER_PUMP = 128
-local TRACK_PATH      = "/disk/music/track.dfpwm"
-local VOLUME          = 1.0
-local DEBUG           = true
-local LOG_PATH        = "/controller.log"
+-- controller.lua
+-- Controller with Advanced Monitor UI and rednet coordination
+-- Requirements:
+--  - Advanced monitor attached
+--  - Modem attached & open
+--  - Disk drive with file: "disk/music/track.dfpwm"
+--  - Three (or more) speaker computers running speaker.lua on same rednet
 
--- ===== Utils =====
-local function now_ms() return os.epoch("utc") end
-local function t() return ("%d"):format(now_ms() % 1000000) end
-local native = term.native()
-local function log_write(s)
-  -- mirror to native terminal
-  local old = term.current()
-  term.redirect(native); print(s); term.redirect(old)
-  -- append to file
-  local fh = fs.open(LOG_PATH, "a"); if fh then fh.writeLine(s); fh.close() end
-end
-local function log(...) if DEBUG then log_write(("[%s][CTRL ] "):format(t()) .. table.concat({...}," ")) end end
-local function broadcast(msg) rednet.broadcast(msg, PROTOCOL) end
+-- ==== CONFIG ====
+local PROTOCOL = "ccsync_audio_v1"
+local SONG_TITLE = "title"
+local DISK_PATH = "disk/music/track.dfpwm"
+-- CC speakers (dfpwm) effectively use ~48kHz. DFPWM packs 8 samples/byte.
+local SAMPLE_RATE = 48000
+local BYTES_PER_SEC = math.floor(SAMPLE_RATE / 8 + 0.5)
 
-local function openAnyModem()
-  for _, s in ipairs(peripheral.getNames()) do
-    if peripheral.getType(s) == "modem" and not rednet.isOpen(s) then rednet.open(s) end
-  end
-end
-local function findMonitor() local m=peripheral.find("monitor"); assert(m,"No monitor"); assert(m.isColor and m.isColor(),"Need advanced monitor"); m.setTextScale(0.5); return m end
-local function findDrive() local d=peripheral.find("drive"); assert(d,"No disk drive"); return d end
-local function fmt_time(s) s=math.max(0,math.floor(s+0.5)); return ("%d:%02d"):format(math.floor(s/60), s%60) end
-local function basename(p) p=tostring(p):gsub("[/\\]+$",""); return p:match("([^/\\]+)$") or p end
+-- ==== PERIPHERALS / REDNET ====
+local mon = peripheral.find("monitor", function(_, p) return peripheral.getType(p) == "monitor" end)
+if not mon then error("No monitor attached.") end
+mon.setTextScale(0.5)
+mon.setBackgroundColor(colors.black)
+mon.clear()
+mon.setCursorPos(1,1)
 
--- ===== UI helper =====
-local UI = {}
-function UI.new(mon)
-  local o={mon=mon,w=0,h=0,buttons={}}
-  function o:resize() self.w,self.h=self.mon.getSize() end
-  function o:clear() self.mon.setBackgroundColor(colors.black); self.mon.clear() end
-  function o:btn(id,label,x,y,w,h,active)
-    self.buttons[id]={x=x,y=y,w=w,h=h}
-    self.mon.setBackgroundColor(active and colors.lime or colors.gray)
-    self.mon.setTextColor(colors.black)
-    for yy=y,y+h-1 do self.mon.setCursorPos(x,yy); self.mon.write((" "):rep(w)) end
-    self.mon.setCursorPos(x+math.floor((w-#label)/2), y+math.floor(h/2)); self.mon.write(label)
-    self.mon.setBackgroundColor(colors.black); self.mon.setTextColor(colors.white)
-  end
-  function o:bar(x,y,w,value)
-    value=math.max(0,math.min(1,value or 0))
-    local fill=math.floor(w*value+0.5)
-    self.mon.setCursorPos(x,y); self.mon.setBackgroundColor(colors.gray); self.mon.write((" "):rep(w))
-    self.mon.setCursorPos(x,y); self.mon.setBackgroundColor(colors.lightBlue); if fill>0 then self.mon.write((" "):rep(fill)) end
-    self.mon.setBackgroundColor(colors.black)
-  end
-  function o:text(x,y,msg,fg,bg)
-    if bg then self.mon.setBackgroundColor(bg) end; if fg then self.mon.setTextColor(fg) end
-    self.mon.setCursorPos(x,y); self.mon.write(msg)
-    self.mon.setTextColor(colors.white); self.mon.setBackgroundColor(colors.black)
-  end
-  function o:hit(x,y)
-    for id,b in pairs(self.buttons) do if x>=b.x and y>=b.y and x<b.x+b.w and y<b.y+b.h then return id end end
-  end
-  o:resize(); return o
+local modem = peripheral.find("modem", function(_, p) return peripheral.getType(p) == "modem" and peripheral.call(p,"isWireless") ~= nil end)
+if not modem then modem = peripheral.find("modem") end
+if not modem then error("No modem attached.") end
+if not peripheral.call(peripheral.getName(modem), "isOpen", 0) then
+  rednet.open(peripheral.getName(modem))
 end
 
--- ===== State =====
-local mon = findMonitor()
-local drive = findDrive()
-openAnyModem(); assert(rednet.isOpen(), "No modem open")
-local ui = UI.new(mon)
+-- ==== LOAD FILE & METADATA ====
+local f = fs.open(DISK_PATH, "rb")
+if not f then error("Could not open "..DISK_PATH) end
+local sizeBytes = fs.getSize(DISK_PATH)  -- cheaper than reading whole file
+f.close()
 
-local chunks, fileBytes, durationSec, title = {}, 0, 0, "Unknown"
-local playing, paused = false, false
-local sid, start_ms = nil, 0
-local pause_accum, pause_started = 0, 0
-local streamer = nil
-local last_chunk_sent, sent_started_ms = 0, 0
+local totalSamples = sizeBytes * 8
+local totalSeconds = totalSamples / SAMPLE_RATE
 
--- ===== Load / Title =====
-local function loadTrack()
-  assert(fs.exists(TRACK_PATH), "Track not found: "..TRACK_PATH)
-  chunks = {}; fileBytes = fs.getSize(TRACK_PATH); durationSec = (fileBytes * 8) / 48000
-  local fh = fs.open(TRACK_PATH, "rb")
-  while true do local d = fh.read(CHUNK_BYTES); if not d then break end; chunks[#chunks+1] = d end
-  fh.close()
-  log("track loaded bytes=", tostring(fileBytes), " chunks=", tostring(#chunks))
-end
-local function readTitle()
-  local label = drive.getDiskLabel and drive.getDiskLabel() or nil
-  title = (label and #label>0) and label or basename(TRACK_PATH)
-  log("title=", title)
-end
+-- ==== SPEAKER DISCOVERY / CACHE DISTRIBUTION ====
+local function center(txt, w) txt = tostring(txt); if #txt >= w then return txt end local pad = math.floor((w - #txt)/2) return string.rep(" ", pad)..txt end
 
--- ===== Playhead/UI =====
-local function playhead_sec()
-  if not playing then return 0 end
-  local base = paused and (pause_started - start_ms - pause_accum) or (now_ms() - start_ms - pause_accum)
-  return math.max(0, base/1000)
-end
-local function redraw()
-  ui:resize(); ui:clear()
-  local w,h=ui.w,ui.h
-  ui:text(2,2,"Now Playing:",colors.yellow); ui:text(2,3,title,colors.white)
-  local playLabel = paused and "Resume" or (playing and "Pause" or "Play")
-  ui:btn("playpause", playLabel, 2,5,10,3, playing and not paused)
-  ui:btn("restart",  "Restart", 14,5,10,3, false)
-  local elapsed=math.min(playhead_sec(), durationSec)
-  local pct=durationSec>0 and (elapsed/durationSec) or 0
-  ui:text(2,9,("[%s / %s]"):format(fmt_time(elapsed), fmt_time(durationSec)), colors.white)
-  ui:bar(2,10,w-3,pct)
-end
-
-local function new_sid() return tostring(now_ms()).."-"..tostring(math.random(1000,9999)) end
-
--- ===== Streamer =====
-local function start_streamer(current_sid, current_start_ms)
-  last_chunk_sent = 0; sent_started_ms = now_ms()
-  streamer = coroutine.create(function()
-    log("stream begin sid=", current_sid, " start_ms=", tostring(current_start_ms))
-    local i=1
-    while i <= #chunks do
-      for _=1, CHUNKS_PER_PUMP do
-        if i > #chunks then break end
-        broadcast({ cmd="CHUNK", sid=current_sid, seq=i, data=chunks[i] })
-        i = i + 1
-      end
-      last_chunk_sent = i-1
-      if last_chunk_sent % 1000 == 0 or last_chunk_sent < 50 then
-        local elapsed = (now_ms() - sent_started_ms)/1000
-        log("sent seq=", tostring(last_chunk_sent), "/", tostring(#chunks), " in ", string.format("%.3fs", elapsed))
-      end
-      coroutine.yield()
-    end
-    broadcast({ cmd="END", sid=current_sid, total=#chunks, start_epoch_ms=current_start_ms })
-    local elapsed = (now_ms() - sent_started_ms)/1000
-    log("END sent total=", tostring(#chunks), " stream_time=", string.format("%.3fs", elapsed))
-  end)
-end
-
-local function pump_streamer()
-  if streamer and coroutine.status(streamer) == "suspended" then
-    for _=1, 200 do
-      if coroutine.status(streamer) ~= "suspended" then break end
-      local ok, err = coroutine.resume(streamer)
-      if not ok then log("streamer error: ", tostring(err)); streamer=nil; break end
-    end
+local function blitBox(x, y, w, h, bg)
+  mon.setBackgroundColor(bg)
+  for i = 0, h-1 do
+    mon.setCursorPos(x, y+i)
+    mon.write(string.rep(" ", w))
   end
 end
 
--- ===== Controls =====
-local function do_start()
-  loadTrack(); readTitle()
-  paused, pause_accum, pause_started = false, 0, 0
-  sid = new_sid()
-  start_ms = now_ms() + DEFAULT_DELAYMS
-  playing = true
-  log("PLAY -> PREP sid=", sid, " start_in_ms=", tostring(start_ms - now_ms()), " chunks=", tostring(#chunks))
-  broadcast({ cmd="PREP", sid=sid, start_epoch_ms=start_ms, volume=VOLUME, name=title })
-  start_streamer(sid, start_ms)
+local function drawText(x, y, txt, fg, bg)
+  mon.setTextColor(fg or colors.white)
+  if bg then mon.setBackgroundColor(bg) end
+  mon.setCursorPos(x, y)
+  mon.write(txt)
 end
-local function do_toggle_pause()
-  if not playing then do_start(); redraw(); return end
-  if not paused then
-    paused, pause_started = true, now_ms()
-    log("PAUSE")
-    broadcast({ cmd="PAUSE", sid=sid })
-  else
-    pause_accum = pause_accum + (now_ms() - pause_started)
-    paused = false
-    log("RESUME")
-    broadcast({ cmd="RESUME", sid=sid })
+
+local w,h = mon.getSize()
+
+local ui = {
+  headerY = 1,
+  buttonsY = 4,
+  progressY = 8,
+  btnW = 12,
+  btnH = 3,
+  gap = 2,
+  playRect = nil,
+  restartRect = nil
+}
+
+local function rectContains(rect, x, y)
+  return x >= rect.x and x <= rect.x+rect.w-1 and y >= rect.y and y <= rect.y+rect.h-1
+end
+
+local function drawUI(state)
+  mon.setBackgroundColor(colors.black); mon.clear()
+  -- Title
+  drawText(1, ui.headerY, center(SONG_TITLE, w), colors.white, colors.black)
+
+  -- Buttons: [ Play/Pause ] [ Restart ]
+  local totalBtnW = ui.btnW*2 + ui.gap
+  local startX = math.floor((w - totalBtnW)/2)+1
+  local btnY = ui.buttonsY
+
+  -- Play/Pause button
+  blitBox(startX, btnY, ui.btnW, ui.btnH, colors.gray)
+  drawText(startX + math.floor((ui.btnW- (#(state.playing and "Pause" or "Play")))/2),
+           btnY + 1, state.playing and "Pause" or "Play", colors.black, colors.gray)
+  ui.playRect = {x=startX, y=btnY, w=ui.btnW, h=ui.btnH}
+
+  -- Restart button
+  local rx = startX + ui.btnW + ui.gap
+  blitBox(rx, btnY, ui.btnW, ui.btnH, colors.gray)
+  drawText(rx + math.floor((ui.btnW- #("Restart"))/2), btnY + 1, "Restart", colors.black, colors.gray)
+  ui.restartRect = {x=rx, y=btnY, w=ui.btnW, h=ui.btnH}
+
+  -- Progress bar background
+  drawText(2, ui.progressY-1, ("0:00 / %d:%02d"):format(math.floor(totalSeconds/60), math.floor(totalSeconds%60)), colors.lightGray, colors.black)
+  blitBox(2, ui.progressY, w-2, 1, colors.lightGray)
+  -- Foreground progress filled based on state.offsetBytes
+  local frac = 0
+  if state.offsetBytes and sizeBytes > 0 then
+    frac = math.max(0, math.min(1, state.offsetBytes / sizeBytes))
   end
-end
-local function do_restart()
-  log("RESTART")
-  broadcast({ cmd="STOP" })
-  playing, paused, sid, streamer = false, false, nil, nil
-  do_start()
+  local filled = math.max(0, math.min(w-2, math.floor((w-2) * frac)))
+  if filled > 0 then
+    blitBox(2, ui.progressY, filled, 1, colors.lime)
+  end
+
+  -- Current time
+  local curSec = math.floor(((state.offsetBytes or 0) * 8) / SAMPLE_RATE + 0.5)
+  drawText(w-10, ui.progressY-1, ("%d:%02d"):format(math.floor(curSec/60), curSec%60), colors.white, colors.black)
 end
 
--- ===== Main =====
-local function main()
-  print("Controller UI (DEBUG) starting… (logs mirrored to /controller.log)")
-  term.redirect(mon); term.setCursorBlink(false)
-  loadTrack(); readTitle(); redraw()
+-- Track speaker list & file caching
+local speakers = {}   -- [id] = true
+local cached = {}     -- [id] = true when their local file is cached
 
-  local refresh = os.startTimer(0)
+local function discoverSpeakers()
+  speakers = {}
+  cached = {}
+  rednet.broadcast({type="hello"}, PROTOCOL)
+  local t = os.startTimer(0.5)
   while true do
-    pump_streamer()
     local ev = { os.pullEvent() }
-
-    if ev[1]=="timer" and ev[2]==refresh then
-      redraw(); refresh = os.startTimer(0.05)
-
-    elseif ev[1]=="monitor_touch" then
-      local _,_,x,y = table.unpack(ev)
-      local id = UI.hit and UI.hit(ui,x,y) or (ui.hit and ui:hit(x,y))
-      if id=="playpause" then do_toggle_pause(); redraw()
-      elseif id=="restart"  then do_restart();      redraw()
+    if ev[1] == "rednet_message" then
+      local id, msg, proto = ev[2], ev[3], ev[4]
+      if proto == PROTOCOL and type(msg)=="table" and msg.type=="speaker_here" then
+        speakers[id] = true
       end
-
-    elseif ev[1]=="disk" or ev[1]=="disk_eject" then
-      if TRACK_PATH:match("^/disk/") and fs.exists(TRACK_PATH) then loadTrack(); readTitle(); redraw() end
-
-    elseif ev[1]=="rednet_message" and ev[4]==PROTOCOL then
-      local sender, msg = ev[2], ev[3]
-      if type(msg)=="table" then
-        if msg.cmd=="NACK" and msg.sid==sid then
-          local seq = tonumber(msg.seq or -1)
-          if seq and chunks[seq] then
-            rednet.send(sender, { cmd="CHUNK", sid=sid, seq=seq, data=chunks[seq] }, PROTOCOL)
-            if seq % 500 == 0 or seq < 10 then log("resend seq=", tostring(seq), " to #", tostring(sender)) end
-          end
-        elseif msg.cmd=="READY"   then log("READY  from #", tostring(sender), " sid=", tostring(msg.sid))
-        elseif msg.cmd=="PAUSED"  then log("PAUSED ack from #", tostring(sender), " seq=", tostring(msg.seq))
-        elseif msg.cmd=="RESUMED" then log("RESUMED ack from #", tostring(sender), " seq=", tostring(msg.seq))
-        elseif msg.cmd=="RESULT"  then log("RESULT from #", tostring(sender), " ok=", tostring(msg.ok), " info=", tostring(msg.info))
-        elseif msg.cmd=="PONG"    then log("PONG from #", tostring(sender))
-        end
-      end
+    elseif ev[1] == "timer" and ev[2]==t then
+      break
     end
   end
 end
 
-main()
+local function sendFileTo(id)
+  -- send small framed chunks so we don't blow out buffers
+  local path = DISK_PATH
+  local fh = fs.open(path, "rb")
+  if not fh then return false, "file open fail" end
+
+  rednet.send(id, {type="cache_begin", name="track.dfpwm", size=sizeBytes}, PROTOCOL)
+
+  local chunkSize = 16*1024
+  local sent = 0
+  while true do
+    local chunk = fh.read(chunkSize)
+    if not chunk then break end
+    rednet.send(id, {type="cache_chunk", data=chunk}, PROTOCOL)
+    sent = sent + #chunk
+    -- yield to keep UI responsive
+    os.sleep(0)
+  end
+  fh.close()
+  rednet.send(id, {type="cache_end"}, PROTOCOL)
+
+  -- wait for ack
+  local ok = false
+  local t = os.startTimer(5)
+  while true do
+    local ev = { os.pullEvent() }
+    if ev[1] == "rednet_message" then
+      local from, msg, proto = ev[2], ev[3], ev[4]
+      if from==id and proto==PROTOCOL and type(msg)=="table" and msg.type=="cache_ok" then
+        ok = true; break
+      end
+    elseif ev[1]=="timer" and ev[2]==t then
+      break
+    end
+  end
+  return ok
+end
+
+local function ensureAllCached()
+  for id,_ in pairs(speakers) do
+    if not cached[id] then
+      local ok = sendFileTo(id)
+      cached[id] = ok or nil
+    end
+  end
+end
+
+-- ==== PLAYBACK STATE ====
+local state = {
+  playing = false,
+  -- offsetBytes = current intended playback offset in file (controller-side source of truth)
+  offsetBytes = 0,
+  -- When playing, we advance offset by elapsed * BYTES_PER_SEC
+  lastPlayEpoch = nil,  -- os.epoch("utc") when play started/resumed
+}
+
+local function now() return os.epoch("utc") end
+
+local function clampOffset(bytes)
+  if bytes < 0 then return 0 end
+  if bytes > sizeBytes then return sizeBytes end
+  return bytes
+end
+
+local function currentOffsetBytes()
+  if not state.playing or not state.lastPlayEpoch then
+    return clampOffset(state.offsetBytes)
+  end
+  local elapsed_ms = now() - state.lastPlayEpoch
+  local adv = math.floor((elapsed_ms/1000) * BYTES_PER_SEC + 0.5)
+  return clampOffset(state.offsetBytes + adv)
+end
+
+local function broadcast(msg)
+  for id,_ in pairs(speakers) do
+    rednet.send(id, msg, PROTOCOL)
+  end
+end
+
+-- Schedule a start exactly 1 tick after the click (target ~50ms from now).
+-- Using epoch time ensures all speakers align, regardless of message arrival tick.
+local function scheduleStart(atEpochMs, offsetBytes)
+  broadcast({type="play", start_at=atEpochMs, offset=offsetBytes})
+end
+
+local function commandPause()
+  broadcast({type="pause"})
+end
+
+local function commandRestart(atEpochMs)
+  broadcast({type="restart", start_at=atEpochMs})
+end
+
+-- ==== MAIN UI LOOP ====
+local function updateUI()
+  -- keep state.offsetBytes coherent while playing
+  if state.playing then
+    local co = currentOffsetBytes()
+    state.offsetBytes = co
+    state.lastPlayEpoch = now() -- reset baseline so we don’t double-advance
+  end
+  drawUI(state)
+end
+
+local function handleMonitorTouch(x, y)
+  if ui.playRect and rectContains(ui.playRect, x, y) then
+    if state.playing then
+      -- Pause: compute current offset precisely, pause speakers, update state
+      state.offsetBytes = currentOffsetBytes()
+      state.playing = false
+      state.lastPlayEpoch = nil
+      commandPause()
+    else
+      -- First play or resume
+      ensureAllCached()
+      local startAt = now() + 50 -- 1 tick ~ 50 ms
+      local offset = clampOffset(state.offsetBytes)
+      scheduleStart(startAt, offset)
+      -- set state to playing from offset
+      state.playing = true
+      state.lastPlayEpoch = now()
+    end
+    updateUI()
+  elseif ui.restartRect and rectContains(ui.restartRect, x, y) then
+    -- Restart from beginning
+    state.offsetBytes = 0
+    local startAt = now() + 50
+    commandRestart(startAt)
+    state.playing = true
+    state.lastPlayEpoch = now()
+    updateUI()
+  end
+end
+
+-- Initial discover + cache (non-blocking-ish; we’ll also cache lazily on first play)
+discoverSpeakers()
+
+-- UI draw once
+updateUI()
+
+-- Event loop
+while true do
+  local e = { os.pullEvent() }
+  if e[1] == "monitor_touch" then
+    local _, side, x, y = table.unpack(e)
+    handleMonitorTouch(x, y)
+  elseif e[1] == "timer" then
+    -- noop
+  elseif e[1] == "rednet_message" then
+    -- track speaker acks/hello to keep 'cached' up to date
+    local id, msg, proto = e[2], e[3], e[4]
+    if proto == PROTOCOL and type(msg) == "table" then
+      if msg.type == "speaker_here" then
+        speakers[id] = true
+      elseif msg.type == "cache_ok" then
+        cached[id] = true
+      end
+    end
+  end
+
+  -- refresh progress bar ~10x/sec without spamming
+  updateUI()
+  os.sleep(0.1)
+end

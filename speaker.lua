@@ -1,18 +1,28 @@
--- speaker_client_stream.lua  (DEBUG build; no pullEventTimeout; 1-tick controls)
+-- speaker_client_stream.lua  (DEBUG+LOG; 1-tick controls; watchdog force-start)
 local PROTOCOL = "ccaudio_sync_v1"
 local DEBUG = true
+local LOG_PATH = "/speaker.log"
 
 -- Low-latency tuning
 local CHUNK_REQUEST_INTERVAL = 0.10  -- seconds
 local PREBUFFER_TARGET = 1           -- start once 1 chunk exists
 local IDLE_WAIT = 0.02               -- seconds
+local FORCE_START_BUF = 32           -- if ≥ this many chunks buffered, force start
+local FORCE_START_MS  = 3000         -- or if waiting > this long since PREP, force start
 
 -- ===== Utilities =====
 local function now_ms() return os.epoch("utc") end
 local function t() return ("%d"):format(now_ms() % 1000000) end
-local function log(...) if DEBUG then print(("[%s][CLIENT] "):format(t()) .. table.concat({...}," ")) end end
 
--- Timer-based “pull with timeout” (event filter + timeout)
+local native = term.native()
+local function log_line(s)
+  local old = term.current()
+  term.redirect(native); print(s); term.redirect(old)
+  local fh = fs.open(LOG_PATH, "a"); if fh then fh.writeLine(s); fh.close() end
+end
+local function log(...) if DEBUG then log_line(("[%s][CLIENT] "):format(t()) .. table.concat({...}," ")) end end
+
+-- Tiny “pull with timeout”
 local function pull_with_timeout(filter, timeout)
   local timer = os.startTimer(timeout or 0)
   while true do
@@ -22,7 +32,7 @@ local function pull_with_timeout(filter, timeout)
   end
 end
 
--- Open any modem
+-- Open modem
 for _, s in ipairs(peripheral.getNames()) do
   if peripheral.getType(s) == "modem" and not rednet.isOpen(s) then rednet.open(s) end
 end
@@ -41,24 +51,33 @@ local function begin_session(sid, controller_id, start_ms, volume)
   sess = {
     sid=sid, controller_id=controller_id, start_ms=tonumber(start_ms) or now_ms(),
     volume=tonumber(volume) or 1.0, buffer={}, next_seq=1, ended=false, total=nil,
-    paused=false, last_nack_time=0, player_task=nil
+    paused=false, last_nack_time=0, player_task=nil, prep_ms=now_ms(), started=false,
   }
 end
 
 -- ===== Player =====
+local function buf_len()
+  local c=0; for _ in pairs(sess.buffer) do c=c+1 end; return c
+end
+
 local function player_loop()
   log("player_loop enter; start_ms=", tostring(sess.start_ms))
 
-  -- Arm until start time
-  while sess and now_ms() + 1 < sess.start_ms do pull_with_timeout(nil, 0.01) end
-  -- Ensure at least 1 chunk once start time arrives
-  while sess and now_ms() >= sess.start_ms do
-    if sess.buffer[sess.next_seq] then break end
-    pull_with_timeout("rednet_message", IDLE_WAIT)
+  -- Arm until start time OR watchdog trips
+  while sess do
+    if now_ms() + 1 >= sess.start_ms and (sess.buffer[sess.next_seq] ~= nil) then break end
+    -- Watchdog: if we’ve been waiting a while or have lots buffered, force start
+    if (now_ms() - (sess.prep_ms or now_ms())) > FORCE_START_MS or buf_len() >= FORCE_START_BUF then
+      if now_ms() < sess.start_ms then log("WATCHDOG: force start (buf=", tostring(buf_len()), ")"); end
+      sess.start_ms = now_ms() - 1
+      break
+    end
+    pull_with_timeout(nil, 0.01)
   end
   if not sess then return end
 
   log("starting playback; next_seq=", tostring(sess.next_seq))
+  sess.started = true
   local decoder = dfpwm.make_decoder()
 
   while sess and (not sess.ended or (sess.total and sess.next_seq <= sess.total)) do
@@ -76,6 +95,7 @@ local function player_loop()
         if not sess or sess.paused then goto cont end
         sess.buffer[sess.next_seq] = nil
         sess.next_seq = sess.next_seq + 1
+        if sess.next_seq % 2048 == 0 then log("played up to seq=", tostring(sess.next_seq-1)) end
       else
         local nowc = os.clock()
         if nowc - (sess.last_nack_time or 0) >= CHUNK_REQUEST_INTERVAL then
@@ -109,7 +129,7 @@ local function pump_player()
   end
 end
 
-print("Speaker client ready (DEBUG).")
+print("Speaker client ready (DEBUG+LOG). See "..LOG_PATH)
 
 -- ===== Main =====
 while true do
@@ -128,9 +148,8 @@ while true do
   elseif msg.cmd == "CHUNK" then
     if sess and msg.sid == sess.sid and type(msg.seq) == "number" and type(msg.data) == "string" then
       sess.buffer[msg.seq] = msg.data
-      if msg.seq % 500 == 0 or msg.seq <= 10 then
-        local bl=0; for _ in pairs(sess.buffer) do bl=bl+1 end
-        log("CHUNK seq=", tostring(msg.seq), " buffer_len≈", tostring(bl))
+      if (msg.seq & 0xff) == 0 or msg.seq <= 16 then
+        log("CHUNK seq=", tostring(msg.seq), " buf≈", tostring(buf_len()))
       end
     end
 
@@ -143,14 +162,13 @@ while true do
     end
 
   elseif msg.cmd == "PAUSE" and sess and msg.sid == sess.sid then
-    log("PAUSE"); sess.paused = true; hard_stop_audio(); ack(sender, "PAUSED", { sid=sess.sid, seq=sess.next_seq })
+    log("PAUSE"); sess.paused = true; hard_stop_audio(); ack(sender,"PAUSED",{sid=sess.sid,seq=sess.next_seq})
 
   elseif msg.cmd == "RESUME" and sess and msg.sid == sess.sid then
-    log("RESUME at seq=", tostring(sess.next_seq))
-    sess.paused = false; os.queueEvent("speaker_audio_empty"); ack(sender,"RESUMED",{sid=sess.sid, seq=sess.next_seq})
+    log("RESUME at seq=", tostring(sess.next_seq)); sess.paused=false; os.queueEvent("speaker_audio_empty"); ack(sender,"RESUMED",{sid=sess.sid,seq=sess.next_seq})
 
   elseif msg.cmd == "STOP" then
-    log("STOP"); hard_stop_audio(); sess = nil; ack(sender, "STOPPED")
+    log("STOP"); hard_stop_audio(); sess = nil; ack(sender,"STOPPED")
   end
 
   ::cont::
